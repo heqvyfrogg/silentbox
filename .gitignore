@@ -1,0 +1,20 @@
+# 生成物・作業用ファイルを Git に含めない
+
+/target/
+/_analyze/
+/_run/
+/_probe_winfsp/
+/tools/jdk21/
+/tools/jdk21.zip
+/tools/jadx-headless-mcp-*.jar
+/tools/jadx-headless-mcp.sha256
+*.apkm
+*.apk
+
+# REA の生出力はサイズが大きいため、証跡として必要な最小限だけ残す方針。
+# 必要になった時点で個別に追加する。
+/analysis/*.err
+
+# OS
+Thumbs.db
+.DS_Store

@@ -1,0 +1,40 @@
+[package]
+name = "terabox-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "tbx: unofficial TeraBox command-line client"
+
+[[bin]]
+name = "tbx"
+path = "src/main.rs"
+
+[dependencies]
+terabox-core.workspace = true
+terabox-tui.workspace = true
+terabox-mount.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+reqwest.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+tokio.workspace = true
+serde_json.workspace = true
+serde.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+dirs.workspace = true
+open = "5"
+keyring = { version = "3", features = ["windows-native"] }
+rpassword = "7"
+chrono.workspace = true
+urlencoding.workspace = true
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+regex = "1"
+
+[features]
+default = []
+# WinFsp バックエンドを tbx に含める。MSVC ターゲットでのみ実用的（実測）。
+winfsp-backend = ["terabox-mount/winfsp-backend"]

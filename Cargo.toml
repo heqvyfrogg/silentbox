@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/terabox-core",
+    "crates/terabox-cli",
+    "crates/terabox-tui",
+    "crates/terabox-mount",
+]
+
+[workspace.package]
+version = "0.1.1"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+authors = ["tbx contributors"]
+description = "Unofficial native TeraBox client (CLI, TUI, Windows mount)"
+
+[workspace.dependencies]
+terabox-core = { path = "crates/terabox-core" }
+terabox-tui = { path = "crates/terabox-tui" }
+terabox-mount = { path = "crates/terabox-mount" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "time", "sync", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "json", "stream", "charset", "http2"] }
+futures = "0.3"
+bytes = "1"
+sha2 = "0.10"
+md-5 = "0.10"
+crc32fast = "1"
+base64 = "0.22"
+hex = "0.4"
+urlencoding = "2"
+chrono = { version = "0.4", features = ["serde"] }
+toml = "0.8"
+dirs = "6"
+rusqlite = { version = "0.32", features = ["bundled"] }
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

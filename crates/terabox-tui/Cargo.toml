@@ -1,0 +1,15 @@
+[package]
+name = "terabox-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "tbx: ratatui front-end for the TeraBox client"
+
+[dependencies]
+terabox-core.workspace = true
+tokio.workspace = true
+ratatui = "0.29"
+crossterm = "0.28"
+anyhow.workspace = true
+chrono.workspace = true

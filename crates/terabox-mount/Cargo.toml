@@ -1,0 +1,35 @@
+[package]
+name = "terabox-mount"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "tbx: Windows mount backends (WinFsp / WebDAV) for TeraBox"
+build = "build.rs"
+
+[dependencies]
+terabox-core.workspace = true
+async-trait = "0.1"
+tempfile = "3"
+tokio.workspace = true
+anyhow.workspace = true
+futures.workspace = true
+bytes.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+tracing.workspace = true
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+urlencoding.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.13", optional = true }
+wincs = { version = "0.1", optional = true }
+
+[features]
+default = []
+# WinFsp バックエンド。MSVC ターゲットでのみ実用的にビルドできる（実測）。
+winfsp-backend = ["dep:winfsp"]
+# Windows Cloud Filter (cfapi) バックエンド。インストーラ不要。
+cfapi-backend = ["dep:wincs"]
