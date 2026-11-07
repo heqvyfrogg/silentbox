@@ -287,3 +287,32 @@ Debian 13（`6.12.113+deb13-amd64`）実機で `tbx mount ~/mnt --mode fuse` を
 - CI に `test-installer` ジョブを追加し、毎 push でインストーラをビルドする。
   BOM の有無を `head -c 3 | xxd` で機械的に確認し、無ければ失敗させる。
   リリース時だけ作ると、壊れたまま配布される（今回それが起きた）。
+## 2026-11-07 実測: インストーラの検証で分かったこと
+
+### NSIS の落とし穴（すべて実測で踏んだ）
+
+| 症状 | 原因 | 対策 |
+|---|---|---|
+| 日本語が `è¨­å®š...` になる | installer.nsi に UTF-8 BOM が無い。NSIS が ANSI（cp1252）として読む | BOM を付ける。CI で `head -c 3 \\| xxd` を確認 |
+| `invalid VIProductVersion format` | `/DVERSION=0.0.0-ci` を 4 桁数値に使った | 表示用と `VERSION4` を分ける |
+| `makensis が見つかりません` | ランナー同梱の NSIS が PATH/所定パスに無い | Chocolatey で導入し、実体パスを確定 |
+| `/DEXE` に絶対パスが渡らない | `/D` は引用符なしの 1 トークン | 相対パスで渡す |
+| 入る exe 名が `tbx-installer-input.exe` | `File` はソースのベース名を使う | `File /oname=${APP_EXE}` |
+| アンインストールで空ディレクトリが残る | `RMDir` 非再帰 + 作業ディレクトリが `$INSTDIR` | `SetOutPath $TEMP` + `RMDir /r` |
+| `/S` でも確認 MessageBox が出て止まる | `MessageBox` が無音を考慮していない | `IfSilent` で飛ばす（既定はデータを残す） |
+
+### 検証できたこと
+
+- 無音インストール → `tbx 0.2.0` が起動。
+- 無音アンインストール → `%LOCALAPPDATA%\silentbox` が完全に消える。
+- 対話アンインストールの確認本文が
+  「設定・キャッシュ・保存済みパスワードも削除しますか？」と正しく表示される
+  （UI オートメーションで文字列を取得）。
+- Linux の `install.sh` が Debian 上で `PREFIX` を尊重して入り、`tbx 0.2.0` が起動。
+
+### 検証できていないこと
+
+- 対話アンインストールの「はい」を押した場合のデータ削除は、GUI 自動操作が
+  NSIS のウィンドウ生成タイミングと噛み合わず確認できていない。無音時の
+  「残す」経路だけが実測済み。
+- インストーラのデジタル署名は無い（SmartScreen の警告が出る可能性がある）。
