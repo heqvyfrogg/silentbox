@@ -143,6 +143,42 @@ jobs:
           & $bin --version
           if ($LASTEXITCODE -ne 0) { throw "--version が $LASTEXITCODE で終了しました" }
 
+      # Windows だけインストーラを作る。NSIS は windows-latest に同梱されている
+      # （実測: NSIS 3.10）。
+      - name: インストーラを作る（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ needs.check-version.outputs.version }}"
+          $bin = (Resolve-Path "target\${{ matrix.target }}\release\tbx.exe").Path
+          $env:PATH = "$env:PATH;C:\Program Files (x86)\NSIS"
+          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
+            throw "makensis が見つかりません（NSIS がランナーに無い可能性）"
+          }
+          Push-Location install
+          makensis /DVERSION=$version /DEXE="$bin" installer.nsi
+          $code = $LASTEXITCODE
+          Pop-Location
+          if ($code -ne 0) { throw "makensis が $code で終了しました" }
+          $setup = "tbx-$version-setup.exe"
+          if (-not (Test-Path $setup)) { throw "インストーラができていません: $setup" }
+          # 中身の確認: 署名はしないが、サイズが 0 でないことと実行形式であることを見る。
+          $size = (Get-Item $setup).Length
+          if ($size -lt 1MB) { throw "インストーラが小さすぎます: $size バイト" }
+          Write-Host "インストーラ: $setup ($size バイト)"
+
+      # インストーラは静かに展開できないため、実際に起動して
+      # 「ファイルが作られたか」までは CI で確認しない（対話 UI を持つ）。
+      # 代わりに 7z で中身を一覧して、tbx.exe が含まれることを確認する。
+      - name: インストーラの中身を確認
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = "${{ needs.check-version.outputs.version }}"
+          $setup = "tbx-$version-setup.exe"
+          & 7z l $setup | Select-String -Pattern "tbx.exe" -Quiet
+          if (-not $?) { throw "インストーラに tbx.exe が含まれていません" }
+
       - name: 圧縮
         shell: bash
         run: |
@@ -156,12 +192,41 @@ jobs:
             tar -C dist -czf "$out.tar.gz" "$out"
           fi
 
+      - name: Linux 用インストーラ（tar.gz に install.sh を同梱）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.check-version.outputs.version }}"
+          cat > "dist/tbx-$version-${{ matrix.target }}/install.sh" <<'SH'
+          #!/bin/sh
+          # tbx のユーザー単位インストーラ（管理者権限不要）
+          set -eu
+          PREFIX="${PREFIX:-$HOME/.local}"
+          BIN_DIR="$PREFIX/bin"
+          here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+          mkdir -p "$BIN_DIR"
+          install -m 755 "$here/tbx" "$BIN_DIR/tbx"
+          echo "インストール先: $BIN_DIR/tbx"
+          case ":$PATH:" in
+            *":$BIN_DIR:"*) echo "PATH には既に入っています。" ;;
+            *) echo "次の行を ~/.profile に足してください: export PATH=\"\$PATH:$BIN_DIR\"" ;;
+          esac
+          echo
+          echo "次: $BIN_DIR/tbx login"
+          echo "マウント: $BIN_DIR/tbx mount ~/tbx"
+          SH
+          chmod +x "dist/tbx-$version-${{ matrix.target }}/install.sh"
+          # 既存のアーカイブを作り直す（install.sh を含めるため）
+          tar -C dist -czf "tbx-$version-${{ matrix.target }}.tar.gz" "tbx-$version-${{ matrix.target }}"
+
       - uses: actions/upload-artifact@v4
         with:
           name: tbx-${{ needs.check-version.outputs.version }}-${{ matrix.target }}
           path: |
             tbx-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.zip
             tbx-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz
+            tbx-${{ needs.check-version.outputs.version }}-setup.exe
           if-no-files-found: error
 
   release:
@@ -177,10 +242,15 @@ jobs:
         run: |
           set -euo pipefail
           count=$(find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) | wc -l)
-          echo "成果物 $count 件"
+          setups=$(find artifacts -type f -name '*-setup.exe' | wc -l)
+          echo "アーカイブ $count 件 / インストーラ $setups 件"
           find artifacts -type f | sort
           if [ "$count" -lt 4 ]; then
-            echo "期待する 4 件に足りません" >&2
+            echo "アーカイブが 4 件に足りません" >&2
+            exit 1
+          fi
+          if [ "$setups" -lt 1 ]; then
+            echo "Windows のインストーラがありません" >&2
             exit 1
           fi
       - uses: softprops/action-gh-release@v2
@@ -191,6 +261,7 @@ jobs:
           files: |
             artifacts/**/*.zip
             artifacts/**/*.tar.gz
+            artifacts/**/*-setup.exe
           generate_release_notes: false
           body: |
             タグ ${{ github.ref_name }} のビルドです。

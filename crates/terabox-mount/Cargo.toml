@@ -35,3 +35,5 @@ default = []
 winfsp-backend = ["dep:winfsp"]
 # Linux / macOS の FUSE バックエンド。libfuse は使わず純 Rust の fuser で実装する。
 fuse-backend = ["dep:fuser"]
+# rclone crypt 互換の暗号化層。既定では含めない。
+crypt = ["terabox-core/crypt"]

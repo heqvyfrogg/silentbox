@@ -28,6 +28,24 @@ rusqlite.workspace = true
 rand.workspace = true
 tracing.workspace = true
 
+# 暗号化 VFS（rclone crypt 互換）。既定では含めない。
+aes = { workspace = true, optional = true }
+xsalsa20poly1305 = { workspace = true, optional = true }
+scrypt = { workspace = true, optional = true }
+data-encoding = { workspace = true, optional = true }
+zeroize = { workspace = true, optional = true }
+
+[features]
+default = []
+# rclone crypt 互換の暗号化層。`--crypt` を使うときに有効化する。
+crypt = [
+    "dep:aes",
+    "dep:xsalsa20poly1305",
+    "dep:scrypt",
+    "dep:data-encoding",
+    "dep:zeroize",
+]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 tempfile = "3"

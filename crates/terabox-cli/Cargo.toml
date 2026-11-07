@@ -40,6 +40,8 @@ regex = "1"
 # 静的リンクが現実的でないため積まない（`--store file` を使う）。
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3", features = ["windows-native"] }
+# 自動実行の登録（HKCU の Run キー）。
+winreg = "0.52"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 keyring = { version = "3", features = ["apple-native"] }
@@ -47,9 +49,16 @@ keyring = { version = "3", features = ["apple-native"] }
 [target.'cfg(all(unix, not(target_os = "macos"), target_env = "gnu"))'.dependencies]
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
+[dev-dependencies]
+# 互換検証の診断用（examples から使う）。
+xsalsa20poly1305 = "0.9"
+scrypt = "0.11"
+
 [features]
 default = []
 # WinFsp バックエンドを tbx に含める。MSVC ターゲットでのみ実用的（実測）。
 winfsp-backend = ["terabox-mount/winfsp-backend"]
 # Linux の FUSE バックエンドを含める。
 fuse-backend = ["terabox-mount/fuse-backend"]
+# rclone crypt 互換の暗号化マウント。既定では含めない。
+crypt = ["terabox-core/crypt", "terabox-mount/crypt"]

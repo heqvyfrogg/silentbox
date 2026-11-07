@@ -4,6 +4,7 @@
 //! 標準出力に JSON だけを出す（パイプで使えるようにする）。
 
 mod accounts;
+mod autostart;
 mod cdp;
 mod format;
 mod login;
@@ -188,6 +189,31 @@ enum Command {
         /// WebDAV の待受ポート。
         #[arg(long, default_value_t = 8765)]
         port: u16,
+        /// 暗号化してマウントする（rclone crypt 互換）。既定は無効。
+        #[arg(long)]
+        crypt: bool,
+    },
+    /// 暗号化の設定を確認・初期化する（rclone crypt 互換）。
+    Crypt {
+        #[command(subcommand)]
+        action: CryptAction,
+    },
+    /// PC 起動時の自動マウントを設定する。
+    Autostart {
+        #[command(subcommand)]
+        action: AutostartAction,
+    },
+    /// 既存のファイルを暗号化形式へ移す。
+    CryptMigrate {
+        /// 対象のディレクトリ（`/` 始まり）。
+        #[arg(default_value = "/")]
+        path: String,
+        /// 実際に移動する（省略時は下見だけ）。
+        #[arg(long)]
+        apply: bool,
+        /// 移動後に元を削除する（`--apply` と併用）。
+        #[arg(long)]
+        delete_source: bool,
     },
     /// 対話画面（TUI）を開く。
     Tui,
@@ -195,6 +221,46 @@ enum Command {
     Doctor,
     /// 未完了の転送を表示する。
     Transfers,
+}
+
+#[derive(Subcommand, Debug)]
+enum AutostartAction {
+    /// 現在の状態を表示する。
+    Status,
+    /// 自動マウントを有効にする。
+    Enable {
+        /// マウント先（Windows はドライブレター、Unix はディレクトリ）。
+        #[arg(long)]
+        target: Option<String>,
+    },
+    /// 自動マウントを無効にする。
+    Disable,
+}
+
+#[derive(Subcommand, Debug)]
+enum CryptAction {
+    /// 現在の設定を表示する（秘密は出さない）。
+    Status,
+    /// 暗号化を初期化する。パスワードと salt を資格情報ストアへ保存する。
+    Setup {
+        /// パスワードを対話で入力する。
+        #[arg(long)]
+        interactive: bool,
+        /// 平文のパスワード（シェルの履歴に残るため非推奨）。
+        #[arg(long)]
+        password: Option<String>,
+        /// salt（`password2`）。省略時は rclone と同じ既定 salt を使う。
+        #[arg(long)]
+        salt: Option<String>,
+        /// 確認なしで有効化する。
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 暗号化を無効にする（保存済みのデータはそのまま残る）。
+    Disable {
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -307,7 +373,19 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Trash { action } => cmd_trash(action, json).await,
         Command::Rm { paths } => cmd_rm(&paths, json).await,
         Command::Mkdir { path } => cmd_mkdir(&path, json).await,
-        Command::Mount { target, mode, port } => cmd_mount(&target, mode, port).await,
+        Command::Mount {
+            target,
+            mode,
+            port,
+            crypt,
+        } => cmd_mount(&target, mode, port, crypt).await,
+        Command::Crypt { action } => cmd_crypt(action, json).await,
+        Command::Autostart { action } => cmd_autostart(action, json).await,
+        Command::CryptMigrate {
+            path,
+            apply,
+            delete_source,
+        } => cmd_crypt_migrate(&path, apply, delete_source, json).await,
         Command::Tui => cmd_tui().await,
         Command::Doctor => cmd_doctor(json).await,
         Command::Transfers => cmd_transfers(json),
@@ -1279,9 +1357,29 @@ async fn cmd_mkdir(path: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_mount(target: &str, mode: MountMode, port: u16) -> Result<()> {
+async fn cmd_mount(target: &str, mode: MountMode, port: u16, crypt: bool) -> Result<()> {
     let client = api().await?;
     let session = client.session().await;
+
+    #[cfg(feature = "crypt")]
+    {
+        // `--crypt` か設定のいずれかが有効なら暗号化でマウントする。
+        if crypt || crypt_config_enabled()? {
+            return mount_encrypted(session, target, mode, port).await;
+        }
+    }
+    #[cfg(not(feature = "crypt"))]
+    if crypt {
+        bail!(
+            "このビルドは暗号化を含んでいません。`--features crypt` を付けてビルドしてください。"
+        );
+    }
+    #[cfg(feature = "crypt")]
+    if !crypt {
+        // 設定で有効になっている場合も `mount_encrypted` へ回るので、ここは
+        // 「crypt 引数も設定も無効」のときだけ通る。
+    }
+
     match mode {
         MountMode::Auto => {
             // OS ごとに最も自然な方式を選ぶ。Windows は WinFsp、Unix は FUSE。
@@ -1304,6 +1402,585 @@ async fn cmd_mount(target: &str, mode: MountMode, port: u16) -> Result<()> {
         MountMode::Winfsp => terabox_mount::mount_winfsp(session, target).await,
         MountMode::Fuse => terabox_mount::mount_fuse(session, target).await,
         MountMode::Webdav => terabox_mount::mount_webdav(session, target, port).await,
+    }
+}
+
+#[cfg(feature = "crypt")]
+/// 設定で暗号化が有効か（`crypt` feature が無いビルドでは常に false）。
+fn crypt_config_enabled() -> Result<bool> {
+    #[cfg(feature = "crypt")]
+    {
+        Ok(terabox_core::crypt::CryptConfig::load()
+            .map_err(|e| anyhow!(e))?
+            .enabled)
+    }
+    #[cfg(not(feature = "crypt"))]
+    {
+        Ok(false)
+    }
+}
+
+/// 自動マウントの設定。
+async fn cmd_autostart(action: AutostartAction, json: bool) -> Result<()> {
+    match action {
+        AutostartAction::Status => {
+            let state = autostart::status();
+            if json {
+                let (enabled, command) = match &state {
+                    autostart::State::Enabled { command } => (true, Some(command.clone())),
+                    autostart::State::Disabled => (false, None),
+                    autostart::State::Unknown(reason) => {
+                        println!(
+                            "{}",
+                            serde_json::json!({"enabled": null, "reason": reason})
+                        );
+                        return Ok(());
+                    }
+                };
+                println!(
+                    "{}",
+                    serde_json::json!({"enabled": enabled, "command": command})
+                );
+            } else {
+                match state {
+                    autostart::State::Enabled { command } => {
+                        println!("自動マウント: 有効");
+                        println!("登録内容: {command}");
+                    }
+                    autostart::State::Disabled => {
+                        println!("自動マウント: 無効（既定）");
+                        println!("有効にするには `tbx autostart enable` を実行してください。");
+                    }
+                    autostart::State::Unknown(reason) => {
+                        println!("自動マウント: 確認できません（{reason}）");
+                    }
+                }
+            }
+            Ok(())
+        }
+        AutostartAction::Enable { target } => {
+            let target = target.unwrap_or_else(autostart::default_target);
+            eprintln!("次の内容で登録します: `tbx mount {target}`");
+            eprintln!("（PC 起動時に自動でマウントします。ログイン済みである必要があります）");
+            let command = autostart::enable(&target).map_err(|e| anyhow!(e))?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({"enabled": true, "target": target, "command": command})
+                );
+            } else {
+                println!("自動マウントを有効にしました。");
+                println!("登録内容: {command}");
+            }
+            Ok(())
+        }
+        AutostartAction::Disable => {
+            let removed = autostart::disable().map_err(|e| anyhow!(e))?;
+            if json {
+                println!("{}", serde_json::json!({"enabled": false, "removed": removed}));
+            } else if removed {
+                println!("自動マウントを無効にしました。");
+            } else {
+                println!("自動マウントは登録されていませんでした。");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// 暗号化してマウントする。
+#[cfg(feature = "crypt")]
+async fn mount_encrypted(
+    session: Session,
+    target: &str,
+    mode: MountMode,
+    port: u16,
+) -> Result<()> {
+    use terabox_core::crypt::{Cipher, CryptConfig};
+
+    let config = CryptConfig::load().map_err(|e| anyhow!(e))?;
+    if !config.enabled {
+        bail!(
+            "暗号化が有効になっていません。`tbx crypt setup` を実行するか、`tbx mount {target} --crypt` を使ってください。"
+        );
+    }
+    let password = load_crypt_password(&config.secret_key)?;
+    let cipher = Cipher::new(&password, &config.salt, &config).map_err(|e| anyhow!(e))?;
+
+    eprintln!(
+        "暗号化モードでマウントします（{}）。保存先には暗号文だけが置かれます。",
+        mode_label(mode)
+    );
+
+    match mode {
+        MountMode::Auto => {
+            if cfg!(windows) {
+                if terabox_mount::winfsp_available() {
+                    return terabox_mount::mount_winfsp_encrypted(session, target, cipher).await;
+                }
+                eprintln!("WinFsp が見つからないため WebDAV モードで起動します。");
+                terabox_mount::mount_webdav_encrypted(session, target, port, cipher).await
+            } else {
+                if terabox_mount::fuse_available() {
+                    return terabox_mount::mount_fuse_encrypted(session, target, cipher).await;
+                }
+                eprintln!("FUSE が使えないため WebDAV モードで起動します。");
+                terabox_mount::mount_webdav_encrypted(session, target, port, cipher).await
+            }
+        }
+        MountMode::Winfsp => {
+            terabox_mount::mount_winfsp_encrypted(session, target, cipher).await
+        }
+        MountMode::Fuse => terabox_mount::mount_fuse_encrypted(session, target, cipher).await,
+        MountMode::Webdav => {
+            terabox_mount::mount_webdav_encrypted(session, target, port, cipher).await
+        }
+    }
+}
+
+#[cfg(feature = "crypt")]
+fn mode_label(mode: MountMode) -> &'static str {
+    match mode {
+        MountMode::Auto => "自動",
+        MountMode::Winfsp => "WinFsp",
+        MountMode::Fuse => "FUSE",
+        MountMode::Webdav => "WebDAV",
+    }
+}
+
+// ---- 暗号化（rclone crypt 互換）。既定は無効 ----
+
+/// 暗号化のパスワードを資格情報ストアから読む。
+#[cfg(feature = "crypt")]
+fn load_crypt_password(secret_key: &str) -> Result<String> {
+    let entry = keyring::Entry::new("tbx.terabox", &format!("crypt:{secret_key}"))
+        .map_err(|e| anyhow!("資格情報ストアを開けません: {e}"))?;
+    match entry.get_password() {
+        Ok(v) => Ok(v),
+        Err(keyring::Error::NoEntry) => bail!(
+            "暗号化のパスワードが保存されていません。`tbx crypt setup` を実行してください。"
+        ),
+        Err(e) => bail!("暗号化のパスワードを読めません: {e}"),
+    }
+}
+
+#[cfg(feature = "crypt")]
+fn store_crypt_password(secret_key: &str, password: &str) -> Result<()> {
+    let entry = keyring::Entry::new("tbx.terabox", &format!("crypt:{secret_key}"))
+        .map_err(|e| anyhow!("資格情報ストアを開けません: {e}"))?;
+    entry
+        .set_password(password)
+        .map_err(|e| anyhow!("暗号化のパスワードを保存できません: {e}"))
+}
+
+async fn cmd_crypt(action: CryptAction, json: bool) -> Result<()> {
+    #[cfg(not(feature = "crypt"))]
+    {
+        let _ = (action, json);
+        bail!("このビルドは暗号化を含んでいません。`--features crypt` を付けてビルドしてください。");
+    }
+
+    #[cfg(feature = "crypt")]
+    {
+        use terabox_core::crypt::CryptConfig;
+
+        match action {
+            CryptAction::Status => {
+                let cfg = CryptConfig::load().map_err(|e| anyhow!(e))?;
+                let saved = load_crypt_password(&cfg.secret_key).is_ok();
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "enabled": cfg.enabled,
+                            "filename_encryption": cfg.filename_encryption,
+                            "directory_name_encryption": cfg.directory_name_encryption,
+                            "salt": if cfg.salt.is_empty() { "既定（rclone と同じ）" } else { "設定済み" },
+                            "password_saved": saved,
+                            "compat": "rclone crypt (standard)",
+                        })
+                    );
+                } else {
+                    println!("暗号化: {}", if cfg.enabled { "有効" } else { "無効（既定）" });
+                    println!("方式: rclone crypt 互換（{}）", cfg.filename_encryption);
+                    println!(
+                        "ディレクトリ名: {}",
+                        if cfg.directory_name_encryption {
+                            "暗号化する"
+                        } else {
+                            "そのまま"
+                        }
+                    );
+                    println!(
+                        "salt: {}",
+                        if cfg.salt.is_empty() {
+                            "既定（rclone と同じ固定値）"
+                        } else {
+                            "設定済み"
+                        }
+                    );
+                    println!(
+                        "パスワード: {}",
+                        if saved {
+                            "保存済み（資格情報ストア）"
+                        } else {
+                            "未保存（`tbx crypt setup` を実行してください）"
+                        }
+                    );
+                    if !cfg.enabled {
+                        println!();
+                        println!(
+                            "有効にするには `tbx crypt setup`、無効にするには `tbx crypt disable`。"
+                        );
+                    }
+                }
+                Ok(())
+            }
+            CryptAction::Setup {
+                interactive,
+                password,
+                salt,
+                yes,
+            } => {
+                let mut cfg = CryptConfig::load().map_err(|e| anyhow!(e))?;
+
+                let new_password = match password {
+                    Some(p) => p,
+                    None => {
+                        if !interactive {
+                            bail!(
+                                "パスワードを指定してください（`--interactive` で対話入力、または `--password`）。"
+                            );
+                        }
+                        rpassword::prompt_password("暗号化のパスワード: ")
+                            .context("パスワードを受け取れませんでした")?
+                    }
+                };
+                if new_password.trim().is_empty() {
+                    bail!("パスワードが空です。");
+                }
+
+                // 既存の暗号文と食い違うパスワードを設定すると、復号できなくなる。
+                // 既に有効な場合は、警告して確認を求める。
+                if cfg.enabled && !yes {
+                    eprintln!("警告: 既に暗号化が有効です。パスワードを変えると、");
+                    eprintln!("既存の暗号化ファイルは復号できなくなります（元に戻せません）。");
+                    eprintln!("続けるには `--yes` を付けてください。");
+                    bail!("中止しました。");
+                }
+
+                if let Some(s) = salt {
+                    cfg.salt = s;
+                }
+                cfg.enabled = true;
+                cfg.save().map_err(|e| anyhow!(e))?;
+                store_crypt_password(&cfg.secret_key, &new_password)?;
+
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "enabled": true,
+                            "salt_set": !cfg.salt.is_empty(),
+                            "password_saved": true,
+                        })
+                    );
+                } else {
+                    println!("暗号化を有効にしました（rclone crypt 互換）。");
+                    println!("パスワードは資格情報ストアにのみ保存しています。");
+                    println!();
+                    println!("注意:");
+                    println!("  - パスワードを失うと、保存したデータは復号できません。");
+                    println!("  - マウント中だけ平文で見えます。公式アプリや Web では暗号文だけが見えます。");
+                    println!("  - 既存の平文ファイルはそのまま残ります。`tbx crypt-migrate` で移せます。");
+                }
+                Ok(())
+            }
+            CryptAction::Disable { yes } => {
+                let mut cfg = CryptConfig::load().map_err(|e| anyhow!(e))?;
+                if !cfg.enabled {
+                    println!("既に無効です。");
+                    return Ok(());
+                }
+                if !yes {
+                    eprintln!("暗号化を無効にすると、以後のマウントは平文で行われます。");
+                    eprintln!("既に保存された暗号文はそのまま残り、復号にはパスワードが要ります。");
+                    bail!("中止しました。`--yes` を付けると実行します。");
+                }
+                cfg.enabled = false;
+                cfg.save().map_err(|e| anyhow!(e))?;
+                if json {
+                    println!("{}", serde_json::json!({"enabled": false}));
+                } else {
+                    println!("暗号化を無効にしました。保存済みの暗号文は残っています。");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+
+/// 既存の平文ファイルを暗号化形式へ移す。
+///
+/// 既定は下見（`--apply` を付けるまで何もしない）。暗号化して送り、
+/// サーバ側のサイズが期待値と一致したことを確認してから、元を消す。
+/// 一致しなければ元を残す（移行の途中でデータを失わない）。
+async fn cmd_crypt_migrate(
+    path: &str,
+    apply: bool,
+    delete_source: bool,
+    json: bool,
+) -> Result<()> {
+    #[cfg(not(feature = "crypt"))]
+    {
+        let _ = (path, apply, delete_source, json);
+        bail!("このビルドは暗号化を含んでいません。`--features crypt` を付けてビルドしてください。");
+    }
+
+    #[cfg(feature = "crypt")]
+    {
+        use terabox_core::crypt::{Cipher, CryptConfig};
+
+        let config = CryptConfig::load().map_err(|e| anyhow!(e))?;
+        if !config.enabled {
+            bail!("暗号化が有効になっていません。`tbx crypt setup` を実行してください。");
+        }
+        let password = load_crypt_password(&config.secret_key)?;
+        let cipher = Cipher::new(&password, &config.salt, &config).map_err(|e| anyhow!(e))?;
+
+        let client = api().await?;
+        let root = terabox_core::vfs::normalize_path(path);
+
+        // 対象を集める（再帰）。
+        let mut queue = vec![root.clone()];
+        let mut files: Vec<(String, String, u64)> = Vec::new();
+        let mut dirs: Vec<String> = Vec::new();
+        while let Some(dir) = queue.pop() {
+            let mut page = 1;
+            loop {
+                let resp = client
+                    .list(&dir, page, 1000, "name", false)
+                    .await
+                    .map_err(map_session_error)?;
+                if resp.list.is_empty() {
+                    break;
+                }
+                for entry in &resp.list {
+                    let rel = entry
+                        .path
+                        .strip_prefix(&root)
+                        .unwrap_or(&entry.path)
+                        .trim_start_matches('/')
+                        .to_string();
+                    if entry.isdir {
+                        dirs.push(rel);
+                        queue.push(entry.path.clone());
+                    } else {
+                        files.push((entry.path.clone(), rel, entry.size));
+                    }
+                }
+                if resp.has_more.unwrap_or(0) == 0 {
+                    break;
+                }
+                page += 1;
+            }
+        }
+
+        if files.is_empty() {
+            println!("{root} に移行するファイルはありません。");
+            return Ok(());
+        }
+
+        println!(
+            "{} のファイル {} 件、フォルダ {} 件を暗号化形式へ移します{}。",
+            root,
+            files.len(),
+            dirs.len(),
+            if apply { "" } else { "（下見のみ）" }
+        );
+
+        // 暗号化の名前は、下見でも表示する（何がどうなるかを見せる）。
+        if !apply {
+            for (remote, rel, size) in files.iter().take(10) {
+                let encrypted = cipher.encrypt_path(rel, false);
+                println!(
+                    "  {remote}（{}）→ /{encrypted}（{} バイト）",
+                    format::bytes(*size),
+                    cipher.encrypted_size(*size)
+                );
+            }
+            if files.len() > 10 {
+                println!("  ... ほか {} 件", files.len() - 10);
+            }
+            println!();
+            println!("実行するには `--apply` を付けてください。");
+            return Ok(());
+        }
+
+        let mut moved = 0usize;
+        let mut failed: Vec<String> = Vec::new();
+        let mut removed = 0usize;
+
+        for (remote, rel, size) in &files {
+            // 1) 平文を読む。
+            let plain = match client.dlink(remote).await {
+                Ok(dlink) => {
+                    let session = client.session().await;
+                    let downloader = Downloader::new(&session).map_err(|e| anyhow!(e))?;
+                    let mut ledger =
+                        Ledger::open(&terabox_core::config::ledger_path()).map_err(|e| anyhow!(e))?;
+                    let req = DownloadRequest {
+                        remote_path: remote.clone(),
+                        fs_id: String::new(),
+                        local_path: std::env::temp_dir().join("tbx-crypt-migrate.bin"),
+                        expected_size: Some(*size),
+                        connections: 1,
+                        part_size: 4 * 1024 * 1024,
+                    };
+                    match downloader.download(&dlink, &req, &mut ledger, |_| {}).await {
+                        Ok(done) => match std::fs::read(&done.local_path) {
+                            Ok(b) => {
+                                let _ = std::fs::remove_file(&done.local_path);
+                                b
+                            }
+                            Err(e) => {
+                                failed.push(format!("{remote}: 読み出しに失敗: {e}"));
+                                continue;
+                            }
+                        },
+                        Err(e) => {
+                            failed.push(format!("{remote}: 取得に失敗: {e}"));
+                            continue;
+                        }
+                    }
+                }
+                Err(e) => {
+                    failed.push(format!("{remote}: dlink を取得できません: {e}"));
+                    continue;
+                }
+            };
+
+            // 2) 暗号化して、暗号名で送る。
+            let sealed = cipher.encrypt_data(&plain);
+            let encrypted_rel = cipher.encrypt_path(rel, false);
+            let parent_rel = match rel.rfind('/') {
+                Some(i) => &rel[..i],
+                None => "",
+            };
+
+            // 親フォルダを（必要なら）暗号名で作る。
+            if !parent_rel.is_empty() {
+                let enc_parent = cipher.encrypt_path(parent_rel, true);
+                let enc_parent_abs = format!("/{enc_parent}");
+                if let Err(e) = client.create_dir(&enc_parent_abs).await {
+                    // 既にある場合は失敗してよい（作成済み）。
+                    let _ = e;
+                }
+            }
+
+            let enc_dir = if parent_rel.is_empty() {
+                root.clone()
+            } else {
+                let enc_parent = cipher.encrypt_path(parent_rel, true);
+                if root == "/" {
+                    format!("/{enc_parent}")
+                } else {
+                    format!("{root}/{enc_parent}")
+                }
+            };
+
+            let mut uploader = Uploader::new(client.clone());
+            let mut ledger =
+                Ledger::open(&terabox_core::config::ledger_path()).map_err(|e| anyhow!(e))?;
+            let tmp = std::env::temp_dir().join(format!("tbx-crypt-{}.bin", encrypted_rel.len()));
+            std::fs::write(&tmp, &sealed).map_err(|e| anyhow!("一時ファイルを書けません: {e}"))?;
+            let req = UploadRequest {
+                local_path: tmp.clone(),
+                remote_dir: enc_dir.clone(),
+                remote_name: Some(encrypted_rel.rsplit('/').next().unwrap_or("file").to_string()),
+                part_size: 4 * 1024 * 1024,
+            };
+            let uploaded = uploader.upload(&req, &mut ledger, |_| {}).await;
+            let _ = std::fs::remove_file(&tmp);
+            if let Err(e) = uploaded {
+                failed.push(format!("{remote}: 暗号文を送れません: {e}"));
+                continue;
+            }
+
+            // 3) 送った暗号文のサイズを確認する（黙って成功を装わない）。
+            let expected = cipher.encrypted_size(plain.len() as u64);
+            let enc_full = format!(
+                "{}/{}",
+                enc_dir.trim_end_matches('/'),
+                req.remote_name.as_deref().unwrap_or("file")
+            );
+            match client
+                .list(&enc_dir, 1, 1000, "name", false)
+                .await
+                .ok()
+                .and_then(|r| {
+                    r.list
+                        .into_iter()
+                        .find(|e| e.path == enc_full)
+                        .map(|e| e.size)
+                }) {
+                Some(actual) if actual == expected => {}
+                Some(actual) => {
+                    failed.push(format!(
+                        "{remote}: 送信後のサイズが想定と違います（{actual} != {expected}）。元は残します"
+                    ));
+                    continue;
+                }
+                None => {
+                    failed.push(format!("{remote}: 送信後に暗号文が見つかりません。元は残します"));
+                    continue;
+                }
+            }
+            moved += 1;
+
+            // 4) 元を消す（明示時のみ）。
+            if delete_source {
+                match client.delete(&[remote.clone()]).await {
+                    Ok(_) => removed += 1,
+                    Err(e) => failed.push(format!("{remote}: 元を消せません: {e}")),
+                }
+            }
+        }
+
+        if json {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "root": root,
+                    "files": files.len(),
+                    "moved": moved,
+                    "removed_source": removed,
+                    "failed": failed,
+                })
+            );
+        } else {
+            println!(
+                "{} 件中 {} 件を暗号化して送りました。{}",
+                files.len(),
+                moved,
+                if delete_source {
+                    format!("元を {} 件削除しました。", removed)
+                } else {
+                    "元はそのまま残しています（`--delete-source` で削除できます）。".to_string()
+                }
+            );
+            if !failed.is_empty() {
+                println!("失敗 {} 件:", failed.len());
+                for f in &failed {
+                    println!("  {f}");
+                }
+            }
+        }
+        if !failed.is_empty() {
+            bail!("{} 件が失敗しました", failed.len());
+        }
+        Ok(())
     }
 }
 
@@ -1469,6 +2146,46 @@ async fn cmd_doctor(json: bool) -> Result<()> {
             "未導入（WebDAV モードで代替できます）".into()
         },
     ));
+
+    // 初心者が最初に見るべき状態。有効/無効と、有効時の注意を 1 行で出す。
+    #[cfg(feature = "crypt")]
+    match terabox_core::crypt::CryptConfig::load() {
+        Ok(cfg) => {
+            let saved = cfg.enabled && load_crypt_password(&cfg.secret_key).is_ok();
+            checks.push((
+                "暗号化".into(),
+                !cfg.enabled || saved,
+                if !cfg.enabled {
+                    "無効（既定）。`tbx crypt setup` で有効にできます".to_string()
+                } else if saved {
+                    "有効（rclone crypt 互換）。パスワードは資格情報ストアに保存済み".to_string()
+                } else {
+                    "有効ですがパスワードが未保存。`tbx crypt setup` を実行してください".to_string()
+                },
+            ));
+        }
+        Err(e) => checks.push(("暗号化".into(), false, format!("設定を読めません: {e}"))),
+    }
+    #[cfg(not(feature = "crypt"))]
+    checks.push((
+        "暗号化".into(),
+        true,
+        "このビルドは暗号化を含みません（`--features crypt` で有効）".to_string(),
+    ));
+
+    match autostart::status() {
+        autostart::State::Enabled { command } => {
+            checks.push(("自動マウント".into(), true, format!("有効: {command}")))
+        }
+        autostart::State::Disabled => checks.push((
+            "自動マウント".into(),
+            true,
+            "無効（既定）。`tbx autostart enable` で有効にできます".to_string(),
+        )),
+        autostart::State::Unknown(reason) => {
+            checks.push(("自動マウント".into(), false, reason))
+        }
+    }
 
     if json {
         let out: Vec<serde_json::Value> = checks

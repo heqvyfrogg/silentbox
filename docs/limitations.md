@@ -224,3 +224,46 @@ Debian 13（`6.12.113+deb13-amd64`）実機で `tbx mount ~/mnt --mode fuse` を
 - 資格情報ストア（Secret Service）が無い環境では
   `Platform secure storage failure: DBus error: The name org.freedesktop.secrets
   was not provided by any .service files` になる。`--store file` を使う。
+## 2026-11-07 実測: 暗号化マウント（rclone crypt 互換）
+
+既定はオフ。`tbx crypt setup` を明示したときだけ有効になる。
+
+### 互換性（実測）
+
+| 方向 | 結果 |
+|---|---|
+| rclone → tbx | rclone が書いた暗号文を tbx が復号できた（本文一致） |
+| tbx → rclone | tbx が書いた暗号文を `rclone cat` が復号できた（日本語含む内容一致） |
+| ファイル名 | 両者が同じ暗号名を生成（`ac967he4f77fg0aqdv61ui4evs` 等） |
+| 移行後のファイル | rclone から `secret.txt` として読め、内容も一致 |
+
+### 実装中に実測で確定したこと
+
+- **認証タグの位置**: Go の `secretbox.Seal` も Rust の `aead` も
+  「暗号文 || タグ」。並べ替えは不要（当初は「タグ先頭」と誤認していた）。
+- **scrypt の `Params::new`**: `len` は 10..=64 しか許さないが、`scrypt()` は
+  出力長を `out` スライスから取る。rclone は 80 バイト必要なので `len=32` を
+  渡し、80 バイトの出力スライスを渡す。
+- **EME の既知ベクタ**: rfjakob/eme の 16 バイト・2048 バイトのベクタで一致。
+- **WebDAV の `net use`**: `WebClient` サービスが停止していると
+  `System error 67`（ネットワーク名が見つからない）で失敗する。暗号化そのもの
+  ではなくドライブ割り当ての問題。
+
+### 未対応
+
+- **暗号化 + WinFsp**: WinFsp のホストは具象 `TeraBoxFs` を要求するため、
+  暗号化層を差し込めない。`--mode webdav` か FUSE を使う。依頼時は明示的に
+  失敗する（平文でマウントしない）。
+- **暗号化されたファイルの部分書き込み**: API が全体置換しか提供しないため、
+  開いたハンドル全体を送り直す。
+- **`obfuscate` のファイル名方式**: `standard` と `off` のみ実装。
+
+## PC 起動時の自動マウント（実測）
+
+- Windows: HKCU の `Run` キーへ `"<exe>" mount T:` を書く。`reg query` で
+  登録・削除を確認済み。
+- Linux: `systemd --user` のユニット。`daemon-reload` を省くと
+  `Unit silentbox.service does not exist` で失敗する（実測 → 修正）。
+- **独自の `XDG_CONFIG_HOME`**: `systemd --user` は起動時の値を固定して持つため、
+  プロセスごとに変えた場所のユニットは認識されない（実測）。警告を出す。
+- 登録するのはマウントだけ。転送やログインは自動で走らせない。

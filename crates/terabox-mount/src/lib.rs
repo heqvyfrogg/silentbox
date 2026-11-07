@@ -27,7 +27,10 @@ pub mod winname;
 #[cfg(all(unix, feature = "fuse-backend"))]
 pub mod fuse_fs;
 
-#[cfg(all(unix, feature = "fuse-backend"))]
+#[cfg(feature = "crypt")]
+pub mod cryptfs;
+
+#[cfg(any(all(unix, feature = "fuse-backend"), feature = "crypt"))]
 use std::sync::Arc;
 
 use terabox_core::Session;
@@ -119,4 +122,80 @@ pub async fn mount_fuse(session: Session, mountpoint: &str) -> anyhow::Result<()
 /// WebDAV バックエンドでマウントする。
 pub async fn mount_webdav(session: Session, drive: &str, port: u16) -> anyhow::Result<()> {
     webdav::serve_and_connect(session, drive, port).await
+}
+
+// ---- 暗号化（rclone crypt 互換）。`crypt` feature のときだけ存在する ----
+
+/// 暗号化の可否を判定する材料。秘密（パスワード）はここに含めない。
+#[cfg(feature = "crypt")]
+pub struct CryptSetup {
+    /// 復号に使う暗号器。
+    pub cipher: terabox_core::crypt::Cipher,
+}
+
+#[cfg(feature = "crypt")]
+impl std::fmt::Debug for CryptSetup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CryptSetup").finish_non_exhaustive()
+    }
+}
+
+/// 暗号化された `RemoteFs` を作る。
+#[cfg(feature = "crypt")]
+pub fn encrypt_fs(
+    session: Session,
+    cipher: terabox_core::crypt::Cipher,
+) -> anyhow::Result<Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>> {
+    let api = terabox_core::api::ApiClient::new(session.clone())?;
+    let inner = Arc::new(remote::TeraBoxFs::new(api, session))
+        as Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>;
+    Ok(Arc::new(cryptfs::CryptFs::new(inner, cipher)))
+}
+
+/// 暗号化して WinFsp でマウントする。
+///
+/// WinFsp のホストは具象 `TeraBoxFs` を要求するため、現時点では暗号化層を
+/// 差し込めない。Windows で暗号化を使う場合は `--mode webdav`（または
+/// `--mode fuse` を含むビルド）を使う。**黙って平文でマウントしない**よう、
+/// 明示的に失敗させる。
+#[cfg(feature = "crypt")]
+pub async fn mount_winfsp_encrypted(
+    _session: Session,
+    _drive: &str,
+    _cipher: terabox_core::crypt::Cipher,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "暗号化と WinFsp の組み合わせは未対応です。`--mode webdav` で暗号化マウントしてください（WebDAV でも中身は暗号化されます）。"
+    )
+}
+
+/// 暗号化して FUSE でマウントする。
+#[cfg(feature = "crypt")]
+pub async fn mount_fuse_encrypted(
+    session: Session,
+    mountpoint: &str,
+    cipher: terabox_core::crypt::Cipher,
+) -> anyhow::Result<()> {
+    #[cfg(all(unix, feature = "fuse-backend"))]
+    {
+        let fs = encrypt_fs(session, cipher)?;
+        fuse_fs::mount(fs, std::path::Path::new(mountpoint), None).await
+    }
+    #[cfg(not(all(unix, feature = "fuse-backend")))]
+    {
+        let _ = (session, mountpoint, cipher);
+        anyhow::bail!("このビルドは FUSE バックエンドを含んでいません。");
+    }
+}
+
+/// 暗号化して WebDAV でマウントする。
+#[cfg(feature = "crypt")]
+pub async fn mount_webdav_encrypted(
+    session: Session,
+    drive: &str,
+    port: u16,
+    cipher: terabox_core::crypt::Cipher,
+) -> anyhow::Result<()> {
+    let fs = encrypt_fs(session, cipher)?;
+    webdav::serve_fs_and_connect(fs, drive, port).await
 }

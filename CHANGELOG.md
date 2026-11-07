@@ -1,5 +1,57 @@
 # 変更履歴
 
+## 0.2.0 — 2026-11-07
+
+### 追加: 暗号化マウント（rclone crypt 互換）
+
+「保存先には暗号文だけが残り、手元のマウントでは普通のファイルとして見える」
+を実現する。**既定はオフ**で、`tbx crypt setup` を明示したときだけ有効になる。
+
+- 内容は NaCl SecretBox（XSalsa20-Poly1305）で 64 KiB チャンク暗号。
+- ファイル名も暗号化する（AES-256 の EME、base32hex）。
+- 鍵導出は scrypt(N=16384, r=8, p=1) で 80 バイト。salt は任意。
+- **rclone と双方向に互換**（実測）:
+  - rclone が作った暗号文を tbx が復号できた。
+  - tbx が作った暗号文を rclone が復号できた（`rclone cat m:secret.txt` が
+    元の日本語を含む内容を返した）。
+  - ファイル名も両者が同じ値になった。
+- 平文のまま置かれたファイルや、別の鍵で作られたファイルは**一覧に出さない**
+  （出した件数は stderr に 1 行で示す）。
+- `tbx crypt status` / `setup` / `disable` を追加。
+- `tbx mount <target> --crypt` で暗号化マウント。WebDAV と FUSE で動く。
+  WinFsp は具象型を要求するため未対応で、**黙って平文に落とさず明示的に失敗**する。
+- `tbx crypt-migrate <path>` で既存の平文を暗号化形式へ移す。既定は下見で、
+  `--apply` を付けるまで何もしない。送信後にサーバ上のサイズを確認し、
+  一致しなければ元を残す。元の削除は `--delete-source` を明示したときだけ。
+
+### 追加: PC 起動時の自動マウント
+
+- `tbx autostart status` / `enable` / `disable`。**既定は無効**。
+- Windows は HKCU の `Run` キー（管理者権限不要）。
+- Linux は `systemd --user` のユニット。`daemon-reload` を先に実行する
+  （省くと `Unit silentbox.service does not exist` で失敗する。実測）。
+- 登録するのはマウントだけ。転送やログインは自動で走らせない。
+
+### 追加: インストーラ
+
+- Windows: NSIS のインストーラ `tbx-<version>-setup.exe`。管理者権限を要求せず
+  `$LOCALAPPDATA` に置く。WinFsp の入手先を開く任意セクションと、
+  自動マウントの任意セクションがある（どちらも既定でチェックしない）。
+  アンインストール時に利用者のデータを勝手に消さない（確認ダイアログで選ぶ）。
+- Linux: `tar.gz` に `install.sh` を同梱。`PREFIX`（既定 `~/.local`）へ入れる。
+
+### 追加: 診断
+
+- `tbx doctor` に「暗号化」「自動マウント」の状態を追加。
+  どちらも既定が無効であることを明示する。
+
+### 修正
+
+- ゴミ箱の `fidlist` は数値配列で送る（文字列配列では `errno 2`）。
+- マウントの容量表示を実値にした（`get_volume_info`）。
+- フォルダ一括ダウンロード、TUI の共有画面、複数アカウント、Linux の FUSE は
+  0.1.1 で入っている。
+
 ## 0.1.1 — 2026-11-07
 
 ### 追加

@@ -42,6 +42,15 @@ const STREAM_CHUNK: u64 = 1024 * 1024;
 pub async fn serve_and_connect(session: Session, drive: &str, port: u16) -> anyhow::Result<()> {
     let api = terabox_core::api::ApiClient::new(session.clone())?;
     let fs: Arc<dyn RemoteFs + Send + Sync> = Arc::new(TeraBoxFs::new(api, session));
+    serve_fs_and_connect(fs, drive, port).await
+}
+
+/// 任意の `RemoteFs` を WebDAV で公開する（暗号化層を差し込むときに使う）。
+pub async fn serve_fs_and_connect(
+    fs: Arc<dyn RemoteFs + Send + Sync>,
+    drive: &str,
+    port: u16,
+) -> anyhow::Result<()> {
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
     let listener = TcpListener::bind(addr).await.map_err(|e| {

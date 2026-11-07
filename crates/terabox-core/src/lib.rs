@@ -20,6 +20,12 @@ pub mod store;
 pub mod transfer;
 pub mod vfs;
 
+// 暗号化バックエンド（rclone crypt 互換）。既定ではビルドに含めない。
+#[cfg(feature = "crypt")]
+pub mod crypt;
+#[cfg(feature = "crypt")]
+pub mod eme;
+
 pub use bootstrap::Bootstrap;
 pub use error::{ApiError, TbxError};
 pub use models::{FsEntry, QuotaInfo, ShareInfo};

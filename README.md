@@ -133,6 +133,43 @@ tools/            REA 用の JDK・JADX と環境設定スクリプト
 単一ファイル上限・同時接続数・VIP 状態は、取得できたときだけ表示する。
 未取得は「未取得」と出す。マウントの容量も取れなければ 0（不明）を返す。
 
+## 暗号化して保存する（既定はオフ）
+
+保存先には暗号文だけを置き、手元のマウントでは普通のファイルとして扱える。
+**rclone crypt 互換**なので、同じパスワードと salt があれば rclone でも復号できる。
+
+```bash
+tbx crypt setup                      # パスワードを設定して有効化（対話入力）
+tbx crypt status                     # 状態（秘密は出さない）
+tbx mount T: --crypt                 # 暗号化してマウント（WebDAV / FUSE）
+tbx crypt-migrate / --apply          # 既存の平文を暗号化形式へ移す（下見が既定）
+tbx crypt disable                    # 無効化（保存済みの暗号文は残る）
+```
+
+- 方式: 内容は NaCl SecretBox（XSalsa20-Poly1305）の 64 KiB チャンク、
+  名前は AES-256 の EME + base32hex、鍵は scrypt(N=16384, r=8, p=1)。
+- 平文のまま置かれたファイルは一覧に出さない（混在を「暗号化済み」と誤認させない）。
+- **パスワードを失うと復号できない。** 資格情報ストアにのみ保存し、設定ファイルには書かない。
+- マウント中だけ平文で見える。公式アプリや Web では暗号文だけが見える。
+- 暗号化と WinFsp の組み合わせは未対応（黙って平文に落とさず、明示的に失敗する）。
+
+## PC 起動時に自動でマウントする
+
+```bash
+tbx autostart status     # 既定は無効
+tbx autostart enable     # 登録（Windows は HKCU\...\Run、Linux は systemd --user）
+tbx autostart disable
+```
+
+登録するのはマウントだけ。転送やログインは自動で走らせない。
+
+## インストール
+
+- Windows: Release の `tbx-<version>-setup.exe`。管理者権限は不要で
+  `%LOCALAPPDATA%\silentbox` に入る。WinFsp は同梱していない（入手先を開くだけ）。
+- Linux: Release の `tar.gz` に `install.sh` が入っている。
+  `PREFIX`（既定 `~/.local`）へ置く。
+
 ## マウントの使い方
 
 ```bash
