@@ -292,6 +292,48 @@ jobs:
             echo "Windows のインストーラがありません" >&2
             exit 1
           fi
+      # リリース本文は CHANGELOG から機械的に作る。手で書くと本文が空になったり
+      # 実装と食い違う（v0.2.0 は本文が無く、WinFsp 同梱前の説明が残っていた）。
+      - name: リリース本文を作る
+        run: |
+          set -euo pipefail
+          version="${{ needs.check-version.outputs.version }}"
+          {
+            echo "変更点・新機能・注意点をまとめたものです。"
+            echo
+            awk -v ver="$version" '
+              /^## / {
+                if (inblock) exit
+                if ($0 ~ "^## " ver "( |$)") { inblock = 1; next }
+              }
+              inblock { print }
+            ' CHANGELOG.md
+            echo
+            echo "### 同梱物"
+            echo
+            echo "- Windows: \`tbx-$version-setup.exe\`（WinFsp の公式インストーラを同梱）"
+            echo "- Windows: \`tbx-$version-x86_64-pc-windows-msvc.zip\`"
+            echo "- Linux: \`tbx-$version-x86_64-unknown-linux-gnu.tar.gz\` / \`tbx-$version-aarch64-unknown-linux-gnu.tar.gz\` / \`tbx-$version-x86_64-unknown-linux-musl.tar.gz\`"
+            echo
+            echo "WinFsp の著作権表示と同梱物の詳細は \`docs/THIRD-PARTY-NOTICES.md\` にあります。"
+          } > release-body.md
+          # 本文が空だと利用者に何も伝わらない。3 つの節が揃っていることを確かめる。
+          # 日本語の文字列一致はロケール依存で不安定なので、ASCII の "### " 見出しの
+          # 数と本文の行数で判定する（実測: シェル経由の日本語 grep は環境で外れた）。
+          headings=$(grep -c '^### ' release-body.md || true)
+          lines=$(wc -l < release-body.md)
+          if [ "$headings" -lt 3 ]; then
+            echo "リリース本文の節が足りません（見出し $headings 個）。CHANGELOG の $version を確認してください。" >&2
+            exit 1
+          fi
+          if [ "$lines" -lt 10 ]; then
+            echo "リリース本文が短すぎます（$lines 行）。" >&2
+            exit 1
+          fi
+          echo "本文: $lines 行 / 節 $headings 個"
+          echo "--- release-body.md ---"
+          cat release-body.md
+
       - uses: softprops/action-gh-release@v2
         with:
           # タイトルはバージョン番号のみ（規律）。
@@ -302,10 +344,4 @@ jobs:
             artifacts/**/*.tar.gz
             artifacts/**/*-setup.exe
           generate_release_notes: false
-          body: |
-            タグ ${{ github.ref_name }} のビルドです。
-            各アーカイブにバイナリとドキュメント（README / CHANGELOG / docs）が入っています。
-
-            Windows の WinFsp バックエンドを使うには WinFsp のランタイムが必要です
-            （LGPL/GPL の都合で DLL は同梱していません）。WinFsp が無い環境では
-            WebDAV モードで動きます。
+          body_path: release-body.md
