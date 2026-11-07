@@ -1,11 +1,14 @@
-//! Windows 向けのマウント実装。
+//! TeraBox のマウント実装。
 //!
-//! 2 つのバックエンドを持つ:
-//! - **WinFsp**: エクスプローラの仮想ドライブ。要 WinFsp ランタイム（MSI）。
+//! 3 つのバックエンドを持つ:
+//! - **WinFsp**（Windows）: エクスプローラの仮想ドライブ。要 WinFsp ランタイム。
 //!   ビルドは `--features winfsp-backend` + MSVC ターゲットが必須（実測）。
-//! - **WebDAV**: インストーラ不要。`net use` でドライブレターを割り当てる。
+//! - **FUSE**（Linux / macOS）: 純 Rust の `fuser` で実装。libfuse 不要。
+//!   ビルドは `--features fuse-backend`。実行時に `/dev/fuse` が要る。
+//! - **WebDAV**: 全 OS 共通。Windows は `net use` でドライブレターを割り当て、
+//!   Unix は接続コマンドを実行せず案内だけ出す（`davfs2` は root が要るため）。
 //!
-//! どちらも共通の `RemoteFs` を経由するため、上位の CLI からは同じ操作で扱える。
+//! どれも共通の `RemoteFs` を経由するため、上位の CLI からは同じ操作で扱える。
 //!
 //! ## 実測した制約
 //! - `windows-gnu` ターゲットでは `winfsp-sys` のビルドが失敗する
@@ -20,6 +23,12 @@ pub mod runtime;
 pub mod teraboxfs;
 pub mod webdav;
 pub mod winname;
+
+#[cfg(all(unix, feature = "fuse-backend"))]
+pub mod fuse_fs;
+
+#[cfg(all(unix, feature = "fuse-backend"))]
+use std::sync::Arc;
 
 use terabox_core::Session;
 
@@ -45,6 +54,20 @@ pub fn winfsp_available() -> bool {
     }
 }
 
+/// FUSE が使えるか。ビルドに含まれていて、`/dev/fuse` が開けることを確かめる。
+pub fn fuse_available() -> bool {
+    #[cfg(all(unix, feature = "fuse-backend"))]
+    {
+        // `/dev/fuse` の存在だけでは不十分だが、無ければ確実に失敗する。
+        // 権限は実際のマウント時に判定される（推測で「使える」と言わない）。
+        std::path::Path::new("/dev/fuse").exists()
+    }
+    #[cfg(not(all(unix, feature = "fuse-backend")))]
+    {
+        false
+    }
+}
+
 /// WinFsp バックエンドでマウントする。
 pub async fn mount_winfsp(session: Session, drive: &str) -> anyhow::Result<()> {
     if !winfsp_available() {
@@ -63,6 +86,32 @@ pub async fn mount_winfsp(session: Session, drive: &str) -> anyhow::Result<()> {
         let _ = drive;
         anyhow::bail!(
             "このビルドは WinFsp バックエンドを含んでいません。`--features winfsp-backend` と MSVC ターゲットでビルドしてください。`tbx mount {drive} --mode webdav` も使えます。"
+        )
+    }
+}
+
+/// FUSE バックエンドでマウントする。`mountpoint` はディレクトリ。
+pub async fn mount_fuse(session: Session, mountpoint: &str) -> anyhow::Result<()> {
+    #[cfg(all(unix, feature = "fuse-backend"))]
+    {
+        let api = terabox_core::api::ApiClient::new(session.clone())?;
+        let fs = Arc::new(remote::TeraBoxFs::new(api, session));
+        // 容量は `TeraBoxFs` だけが持つ。`RemoteFs` を広げずに済むよう、
+        // 参照を持たせたクロージャで渡す。
+        let usage_source = Arc::clone(&fs);
+        let usage: Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync> = Arc::new(move || {
+            let remote_api = Arc::clone(&usage_source);
+            crate::runtime::block_on(async move { remote_api.usage().await })
+                .map(|u| (u.total, u.free))
+        });
+        fuse_fs::mount(fs, std::path::Path::new(mountpoint), Some(usage)).await
+    }
+    #[cfg(not(all(unix, feature = "fuse-backend")))]
+    {
+        let _ = session;
+        let _ = mountpoint;
+        anyhow::bail!(
+            "このビルドは FUSE バックエンドを含んでいません。`--features fuse-backend` でビルドしてください。`tbx mount {mountpoint} --mode webdav` も使えます。"
         )
     }
 }

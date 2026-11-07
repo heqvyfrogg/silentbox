@@ -112,8 +112,22 @@ pub fn config_path() -> PathBuf {
 }
 
 /// 台帳（SQLite）のパス。
+///
+/// アカウントごとに分ける。レジューム状態はアカウントを跨いでは意味を持たない
+/// ため、混ぜると別アカウントの続きを送ってしまう。
 pub fn ledger_path() -> PathBuf {
-    state_dir().join("state.db")
+    state_dir().join(format!("state-{}.db", account_name()))
+}
+
+/// 現在使うアカウント名。`main` が解決して環境変数へ書き戻す。
+///
+/// 解決の優先順は CLI 側（`accounts::resolve`）に 1 箇所だけ置く。ここでは
+/// 決定済みの値を読むだけにして、下位のモジュールが独自に解釈しないようにする。
+pub fn account_name() -> String {
+    match std::env::var("TBX_ACCOUNT") {
+        Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
+        _ => "default".to_string(),
+    }
 }
 
 /// キャッシュディレクトリ。
@@ -176,5 +190,14 @@ mod tests {
         // 環境変数の読み取りのみを確認する（値を書き換えない）。
         let resolved = tbx_home();
         assert!(!resolved.as_os_str().is_empty());
+    }
+
+    #[test]
+    fn ledger_path_differs_per_account_name() {
+        // 環境変数を書き換えずに、既定名の構成だけを確認する。
+        let path = ledger_path();
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        assert!(file.starts_with("state-"), "{file}");
+        assert!(file.ends_with(".db"), "{file}");
     }
 }

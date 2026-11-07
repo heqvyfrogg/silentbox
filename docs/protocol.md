@@ -260,6 +260,16 @@ openresty が **405 Not Allowed** を返す。ホストを分ける必要があ�
 `ondup=overwrite` を付けても同じだった。**先に削除してから create すると
 同じパスに置ける**（実測で確認済み）。
 
+### 共有の作成（実測）
+
+`/share/create` と `/api/share/create` の両方に POST したが、どちらも
+**HTTP 405 Method Not Allowed**（openresty）だった。`filelist` を
+`[{"fs_id":"..."}]` の形で送っても同じ。
+
+したがってクライアントから共有リンクを作る手段は特定できていない。共有内の
+dlink も `/share/streaming`（署名必須）経由でしか引けないため、共有は
+「一覧表示」と「自分の領域への保存」までとする。
+
 ### ゴミ箱（実測）
 
 `fidlist` は数値の配列でなければ通らない。

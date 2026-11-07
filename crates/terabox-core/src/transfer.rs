@@ -25,7 +25,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::api::{normalize_shorturl, ApiClient};
+use crate::api::ApiClient;
 use crate::error::{ApiError, TbxError};
 use crate::session::Session;
 use crate::store::{Kind, Ledger, State};
@@ -724,29 +724,6 @@ pub fn join_remote(dir: &str, name: &str) -> String {
     } else {
         format!("{dir}/{name}")
     }
-}
-
-/// 共有リンクの中身をまとめてダウンロードする際の対象選択。
-///
-/// 共有リンクは `fs_id` とパスが噛み合わないことがあるため、パスではなく
-/// `shorturl` + `fs_id` で dlink を引く経路を用意する。
-pub async fn share_dlink(
-    api: &ApiClient,
-    shorturl: &str,
-    fs_id: &str,
-    uk: &str,
-) -> Result<String, TbxError> {
-    let id = normalize_shorturl(shorturl);
-    let _ = (api, uk);
-    let value = api.share_list(&id, "/", 1, 100).await?;
-    let entry = value
-        .iter()
-        .find(|e| e.fs_id == fs_id)
-        .ok_or_else(|| TbxError::Other(format!("共有内に fs_id {fs_id} が見つかりません")))?;
-    // 共有側の dlink は `/share/streaming` ではなく、`shorturlinfo` が返す
-    // `list[].dlink` を使う経路もある。ここではパスのみを返し、呼び出し側が
-    // `pcs/file` で解決する（未検証のため推測で URL を組み立てない）。
-    Ok(entry.path.clone())
 }
 
 #[cfg(test)]

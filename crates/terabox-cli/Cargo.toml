@@ -22,11 +22,11 @@ clap = { version = "4", features = ["derive", "env"] }
 tokio.workspace = true
 serde_json.workspace = true
 serde.workspace = true
+toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 dirs.workspace = true
 open = "5"
-keyring = { version = "3", features = ["windows-native"] }
 rpassword = "7"
 chrono.workspace = true
 urlencoding.workspace = true
@@ -34,7 +34,20 @@ tokio-tungstenite = "0.24"
 futures-util = "0.3"
 regex = "1"
 
+# 資格情報ストアは OS ごとにバックエンドが違う。musl では D-Bus の
+# 静的リンクが現実的でないため積まない（`--store file` を使う）。
+[target.'cfg(target_os = "windows")'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(all(unix, not(target_os = "macos"), target_env = "gnu"))'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
 [features]
 default = []
 # WinFsp バックエンドを tbx に含める。MSVC ターゲットでのみ実用的（実測）。
 winfsp-backend = ["terabox-mount/winfsp-backend"]
+# Linux の FUSE バックエンドを含める。
+fuse-backend = ["terabox-mount/fuse-backend"]

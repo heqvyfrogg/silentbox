@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+      # WinFsp バックエンドは MSVC ターゲットでのみビルドできる（実測）。
+      # ビルドが通ることと実行できることは別なので、バイナリを起動して
+      # 終了コードを確認する（WinFsp の DLL は同梱しないため、
+      # --version だけを実行する）。
+      - name: ビルド（WinFsp 込み）
+        run: cargo build --release -p terabox-cli --features winfsp-backend --target x86_64-pc-windows-msvc
+      - name: 試験
+        run: cargo test --workspace --bins --lib
+      - name: バイナリを起動して確認
+        run: |
+          $exe = "target\x86_64-pc-windows-msvc\release\tbx.exe"
+          if (-not (Test-Path $exe)) { throw "ビルド成果物がありません: $exe" }
+          & $exe --version
+          if ($LASTEXITCODE -ne 0) { throw "--version が $LASTEXITCODE で終了しました" }
+          & $exe --help | Out-Null
+        shell: pwsh
+
+  test-linux-gnu:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-gnu
+      # FUSE バックエンドは fuser（純 Rust）なので libfuse は不要。
+      # 資格情報ストアは Secret Service を使うため、D-Bus のヘッダが要る。
+      - name: 依存パッケージ
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+      - name: ビルド（FUSE 込み）
+        run: cargo build --release -p terabox-cli --features fuse-backend
+      - name: 試験（FUSE 込み）
+        # fuse-backend は terabox-cli の feature。ワークスペース全体の試験では
+        # terabox-cli を明示して feature を有効にする。
+        run: cargo test --workspace --bins --lib --features terabox-cli/fuse-backend
+      - name: バイナリを起動して確認
+        run: |
+          ./target/release/tbx --version
+          ./target/release/tbx --help > /dev/null
+
+  test-linux-musl:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-musl
+      # musl は D-Bus の静的リンクが現実的でないため、資格情報ストアを積まない。
+      # `--store file` を明示して使う（README に記載）。
+      - name: ビルド
+        run: cargo build --release -p terabox-cli --target x86_64-unknown-linux-musl
+      - name: alpine で起動確認（ビルドが通るだけでは足りない）
+        run: |
+          docker run --rm -v "$PWD/target/x86_64-unknown-linux-musl/release:/app" \
+            --platform linux/amd64 alpine:3.20 /app/tbx --version

@@ -2,6 +2,54 @@
 
 ## 0.1.1 — 2026-11-07
 
+### 追加
+
+- **複数アカウント**。`--account` / `TBX_ACCOUNT` / 索引の既定 / `default` の順で
+  解決する。`tbx accounts` で一覧、`tbx use` で既定を切替、`tbx login --name` で
+  追加、`tbx logout [<名前>] [--all]` で削除。秘密は資格情報ストアの
+  `account:<名前>` に置き、`--store file` を明示したときだけ
+  `secrets/<名前>.json` へ 0600 で書く（緩い権限のファイルは読む前に拒否）。
+  台帳は `state-<名前>.db` に分離。旧 `session` 1 件は初回に `default` へ移行。
+- **Linux / macOS の FUSE バックエンド**（`--features fuse-backend`）。
+  純 Rust の `fuser` を使い、libfuse 無しでビルドできる。`--mode fuse` と
+  `--mode auto`（Unix では FUSE 優先）。読み書き・`statfs` は実値。
+- **フォルダ一括ダウンロード**。`tbx get /dir`。階層を再現し、`--jobs` で同時数。
+  空フォルダも作る。
+- **TUI の共有画面**。URL を入力して Enter で解決し、一覧とサイズを表示する。
+- **タグ連動リリース**。`v*` タグで Windows（WinFsp）、Linux gnu（FUSE）、
+  Linux musl、aarch64 の 4 本をビルドし Release に添付する。タグと
+  `Cargo.toml` の版が食い違えば失敗する。CI は 3 OS でビルドと起動確認を行う。
+
+### 変更
+
+- 依存をターゲット別に分けた。資格情報ストアは Windows / macOS / Linux-gnu で
+  有効、musl では積まない（`--store file` 前提）。
+- `which` が Unix では実行ビットを見る。ブラウザ探索は Chrome 系の
+  ディストリ別実行名（`google-chrome` / `chromium` / `brave-browser` など）に対応。
+- WebDAV のドライブ接続は Windows のみ実行。Unix では接続コマンドを走らせず、
+  URL と使える手段を表示する（`davfs2` は root 権限を要するため）。
+- `rust-version` を 1.90 にした（1.82 では `clap_builder` などが
+  `edition2024` を要求して解けない）。
+
+### 修正
+
+- **使われていない `share_dlink` を削除**。共有の直接ダウンロードは署名必須の
+  `/share/streaming` に依存するため作らない。`/share/create` は
+  `www.terabox.com` でも `/api/share/create` でも HTTP 405 だった（実測）。
+- **宣言だけの `cfapi-backend` を撤去**。実装が 1 行も無く、依存だけを引いていた。
+- FUSE の `AutoUnmount` を外した。既定の ACL（Owner）では
+  `auto_unmount requires acl != Owner` でマウントできない（実測）。
+
+### 実測
+
+- Windows: 2 アカウントの切替、台帳の分離、旧セッションの移行、フォルダ一括取得
+  （3 件・26.1 KiB・内容一致）、20 MiB の分割アップロード（5 パート・9.2 MiB/s）。
+- Linux（Debian 13）: FUSE のマウント・一覧・全量読み出し・書き込み・`statfs`。
+- 速度: 20 MiB の分割ダウンロードで 1 接続 1.80、2 接続 1.98、4 接続 2.20、
+  8 接続 1.41 MiB/s。4 接続が最良。
+
+## 0.1.0 — 2026-11-06
+
 Windows マウント（WinFsp）の実アカウント検証で見つかった不具合を修正。
 
 ### 修正

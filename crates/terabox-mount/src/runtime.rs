@@ -8,6 +8,15 @@ use std::sync::OnceLock;
 
 use tokio::runtime::{Handle, Runtime};
 
+/// 共有ランタイム上で future を完了させる。
+///
+/// `Handle::block_on` はコールバック（専用スレッド）から呼ばれる前提。
+/// 同一スレッド内でランタイムを走らせている場合に再入すると失敗するため、
+/// 呼び出し元はランタイムのスレッドでないことを前提にする。
+pub fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    handle().block_on(fut)
+}
+
 static RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 /// 遅延初期化した共有ランタイムのハンドル。

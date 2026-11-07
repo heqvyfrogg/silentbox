@@ -89,43 +89,69 @@ pub async fn serve_and_connect(session: Session, drive: &str, port: u16) -> anyh
     Ok(())
 }
 
-/// `net use` でドライブを割り当てる。
+/// ドライブを割り当てる。
+///
+/// Windows は `net use` でドライブレターを割り当てる。Unix では接続コマンドを
+/// **実行しない**（`mount.davfs` は root 権限と `/etc/fstab` を要求するため、
+/// 勝手に走らせない）。代わりに実際の URL と、その環境で使える手段を出す。
 fn connect_drive(drive: &str, port: u16) -> anyhow::Result<()> {
-    let letter = drive.trim_end_matches(':');
-    if letter.len() != 1 || !letter.chars().next().unwrap().is_ascii_alphabetic() {
-        anyhow::bail!("ドライブレターの指定が不正です（例: T:）: {drive}");
+    #[cfg(windows)]
+    {
+        let letter = drive.trim_end_matches(':');
+        if letter.len() != 1 || !letter.chars().next().unwrap().is_ascii_alphabetic() {
+            anyhow::bail!("ドライブレターの指定が不正です（例: T:）: {drive}");
+        }
+
+        // 既存の割り当てがあれば先に外す（残骸で失敗するのを避ける）。
+        let _ = std::process::Command::new("net")
+            .args(["use", &format!("{letter}:"), "/delete", "/y"])
+            .output();
+
+        let output = std::process::Command::new("net")
+            .args([
+                "use",
+                &format!("{letter}:"),
+                &format!("http://127.0.0.1:{port}/"),
+            ])
+            .output()?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            anyhow::bail!(
+                "ドライブの割り当てに失敗しました（net use {letter}:）: {}{}",
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+        let _ = drive;
+        Ok(())
     }
-
-    // 既存の割り当てがあれば先に外す（残骸で失敗するのを避ける）。
-    let _ = std::process::Command::new("net")
-        .args(["use", &format!("{letter}:"), "/delete", "/y"])
-        .output();
-
-    let output = std::process::Command::new("net")
-        .args([
-            "use",
-            &format!("{letter}:"),
-            &format!("http://127.0.0.1:{port}/"),
-        ])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        anyhow::bail!(
-            "ドライブの割り当てに失敗しました（net use {letter}:）: {}{}",
-            stdout.trim(),
-            stderr.trim()
-        );
+    #[cfg(not(windows))]
+    {
+        let _ = drive;
+        let url = format!("http://127.0.0.1:{port}/");
+        println!("WebDAV の URL: {url}");
+        println!("この環境では自動でマウントしません。次のいずれかで繋いでください:");
+        println!("  gvfs-mount dav://127.0.0.1:{port}/        （GNOME）");
+        println!("  mount -t davfs {url} <マウント先>          （davfs2・要 root）");
+        println!("または `tbx mount <ディレクトリ> --mode fuse`（FUSE ビルド時）を使います。");
+        Ok(())
     }
-    Ok(())
 }
 
 fn disconnect_drive(drive: &str) {
-    let letter = drive.trim_end_matches(':');
-    let _ = std::process::Command::new("net")
-        .args(["use", &format!("{letter}:"), "/delete", "/y"])
-        .output();
+    #[cfg(windows)]
+    {
+        let letter = drive.trim_end_matches(':');
+        let _ = std::process::Command::new("net")
+            .args(["use", &format!("{letter}:"), "/delete", "/y"])
+            .output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = drive;
+    }
 }
 
 /// 1 リクエストを処理する。テストからも直接呼べるようにしておく。

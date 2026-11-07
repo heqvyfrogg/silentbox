@@ -64,6 +64,12 @@ struct App {
     status: String,
     quota: Option<QuotaInfo>,
     logs: Vec<String>,
+    /// 共有ペインで入力中の URL。
+    share_input: String,
+    /// 共有ペインで解決した結果。
+    share_entries: Vec<FsEntry>,
+    /// 共有ペインで解決した共有 ID。
+    share_id: Option<String>,
 }
 
 /// 描画と入力のループを回す。
@@ -85,6 +91,9 @@ pub async fn run(api: ApiClient) -> anyhow::Result<()> {
         status: String::from("読み込み中..."),
         quota: None,
         logs: Vec::new(),
+        share_input: String::new(),
+        share_entries: Vec::new(),
+        share_id: None,
     };
 
     app.reload().await;
@@ -137,7 +146,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<bool> {
         }
         KeyCode::Char('g') => app.selected = 0,
         KeyCode::Char('G') => app.selected = app.entries.len().saturating_sub(1),
-        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => {
+        KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right if app.pane != Pane::Share => {
             if let Some(entry) = app.entries.get(app.selected) {
                 if entry.isdir {
                     app.cwd = normalize_path(&entry.path);
@@ -146,7 +155,14 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<bool> {
                 }
             }
         }
-        KeyCode::Char('h') | KeyCode::Left | KeyCode::Backspace => {
+        KeyCode::Char('h') | KeyCode::Left => {
+            if app.cwd != "/" {
+                app.cwd = parent_path(&app.cwd);
+                app.selected = 0;
+                app.reload().await;
+            }
+        }
+        KeyCode::Backspace if app.pane != Pane::Share => {
             if app.cwd != "/" {
                 app.cwd = parent_path(&app.cwd);
                 app.selected = 0;
@@ -161,6 +177,28 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<bool> {
         KeyCode::Char('2') => app.pane = Pane::Share,
         KeyCode::Char('3') => app.pane = Pane::Quota,
         KeyCode::Char('?') => app.pane = Pane::Help,
+        // 共有ペインでは URL を入力し、Enter で解決する。
+        // 共有ペインでは文字を URL 欄へ。ただし操作キー（q/j/k/h/l/d/p/r/1-3/?）は除く。
+        KeyCode::Char(c)
+            if app.pane == Pane::Share
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !matches!(c, 'q' | 'j' | 'k' | 'h' | 'l' | 'd' | 'p' | 'r' | 'g' | 'G' | '1' | '2' | '3' | '?') =>
+        {
+            if c.is_ascii_graphic() {
+                app.share_input.push(c);
+            }
+        }
+        KeyCode::Backspace if app.pane == Pane::Share => {
+            app.share_input.pop();
+        }
+        KeyCode::Enter if app.pane == Pane::Share => {
+            let url = app.share_input.trim().to_string();
+            if url.is_empty() {
+                app.status = "共有 URL を入力してください".to_string();
+            } else {
+                resolve_share(app, &url).await;
+            }
+        }
         KeyCode::Char('d') => {
             if let Some(entry) = app.entries.get(app.selected).cloned() {
                 if !entry.isdir {
@@ -182,8 +220,7 @@ async fn handle_key(app: &mut App, key: KeyEvent) -> anyhow::Result<bool> {
 }
 
 impl App {
-    async fn reload(&mut self) {
-        match self.api.list(&self.cwd, 1, 2000, "name", false).await {
+    async fn reload(&mut self) {        match self.api.list(&self.cwd, 1, 2000, "name", false).await {
             Ok(resp) => {
                 self.entries = resp.list;
                 if self.selected >= self.entries.len() {
@@ -209,6 +246,34 @@ impl App {
         self.logs.push(line);
         if self.logs.len() > 500 {
             self.logs.remove(0);
+        }
+    }
+}
+
+/// 共有 URL を解決して一覧を取り込む。
+async fn resolve_share(app: &mut App, url: &str) {
+    app.status = format!("{url} を解決しています");
+    match app.api.shorturl_info(url).await {
+        Ok(info) => {
+            let entries = if info.entries.is_empty() {
+                match app.api.share_list(url, "/", 1, 1000).await {
+                    Ok(list) => list,
+                    Err(e) => {
+                        app.status = format!("一覧を取得できません: {e}");
+                        return;
+                    }
+                }
+            } else {
+                info.entries.clone()
+            };
+            app.share_id = Some(info.share_id.clone());
+            app.status = format!("{} 件（共有 {}）", entries.len(), info.share_id);
+            app.push_log(format!("共有 {url}: {} 件", entries.len()));
+            app.share_entries = entries;
+        }
+        Err(e) => {
+            app.status = format!("共有を解決できません: {e}");
+            app.share_entries.clear();
         }
     }
 }
@@ -433,7 +498,42 @@ fn draw_pane(f: &mut Frame, area: Rect, app: &App) {
         ),
         Pane::Share => (
             " 共有 ",
-            "共有リンクは CLI から: tbx share <url> [--save]\n\nこの画面からはまだ実行できません。".to_string(),
+            {
+                let mut lines = Vec::new();
+                lines.push("共有 URL を入力して Enter:".to_string());
+                lines.push(format!("  {}", app.share_input));
+                lines.push(String::new());
+                if let Some(id) = &app.share_id {
+                    lines.push(format!("共有 ID: {id}"));
+                }
+                if app.share_entries.is_empty() {
+                    if app.share_id.is_some() {
+                        lines.push("この共有は空です。".to_string());
+                    } else {
+                        lines.push("例: https://www.terabox.com/s/1abcd1234".to_string());
+                        lines.push(String::new());
+                        lines.push(
+                            "共有の中身は表示できますが、直接のダウンロードはできません。"
+                                .to_string(),
+                        );
+                        lines.push(
+                            "`tbx share <url> --save` で自分の領域へ保存してから取得してください。"
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    lines.push(format!("{} 件", app.share_entries.len()));
+                    for entry in &app.share_entries {
+                        let size = if entry.isdir {
+                            "-".to_string()
+                        } else {
+                            human(entry.size)
+                        };
+                        lines.push(format!("  {}  {}", entry.display_name(), size));
+                    }
+                }
+                lines.join("\n")
+            },
         ),
         Pane::Quota => {
             let text = match &app.quota {

@@ -1,7 +1,7 @@
 # tbx — TeraBox の非公式ネイティブクライアント
 
 広告なし・並列転送・ドライブマウントを備えた TeraBox クライアント。Rust 製で、
-CLI と TUI と Windows のドライブマウントを同じコアから提供する。
+CLI と TUI と OS ネイティブのマウントを同じコアから提供する。
 
 公式アプリ（`com.dubox.drive` 4.28.2）を解析してプロトコルを移植した別実装で
 あり、APK の改変・再配布は行わない。解析の根拠は `docs/protocol.md` にある。
@@ -12,72 +12,105 @@ CLI と TUI と Windows のドライブマウントを同じコアから提供�
   Smaato, Vungle, AppLovin, InMobi, Facebook）を同梱しているが、本クライアントは
   それらを一切含まない。
 - **並列ダウンロード**。`Range` 指定で分割し、中断しても続きから再開する。
+  実測では 4 接続が最良（無料枠は 8 接続で逆に遅くなる）。
 - **分割アップロード**。パート単位で送り、送信済みパートは飛ばす。
+- **フォルダ一括ダウンロード**。`tbx get /dir` で階層を再現してまとめて取る。
+- **複数アカウント**。名前付きで保持し、`--account` で切り替える。
 - **共有リンク**。`/s/1xxxx` を解決して一覧表示し、自分の領域へ保存する。
 - **外部プレーヤ再生**。dlink を mpv / VLC / ffplay へ渡す。
-- **容量・VIP・制限の可視化**。サーバが返した値だけを表示し、推測で埋めない。
-- **ドライブマウント**。WinFsp（要ランタイム）または WebDAV（インストーラ不要）。
+- **容量・制限の可視化**。サーバが返した値だけを表示し、推測で埋めない。
+  無料枠の内訳（恒久 + 期間限定）と期限も出す。
+- **ドライブマウント**。Windows は WinFsp、Linux / macOS は FUSE、
+  どこでも WebDAV。
 - **TUI**。一覧・転送・共有・容量を 1 画面で扱う。
 
 ## 必要なもの
 
 | 用途 | 必須 | 備考 |
 |---|---|---|
-| ビルド | Rust 1.82 以降 | 実測は 1.96.0 |
-| ログイン | Chrome または Edge | 専用プロファイルで起動する |
-| WinFsp マウント | WinFsp 2.x | 無い場合は WebDAV モードで動く |
-| WinFsp のビルド | MSVC ターゲット | `windows-gnu` では `winfsp-sys` が失敗する |
+| ビルド | Rust 1.90 以降 | 実測は 1.96.0（Windows）。1.82 では依存が解けない |
+| ログイン | Chrome 系ブラウザ | CDP を話せる必要がある。Firefox は不可 |
+| Windows のマウント | WinFsp 2.x | 無い場合は WebDAV モードで動く |
+| Windows のビルド | MSVC ターゲット | `windows-gnu` では `winfsp-sys` が失敗する |
+| Linux のマウント | `fuse3`（`fusermount3`）と `/dev/fuse` | カーネル側の FUSE も必要 |
+| Linux の資格情報 | Secret Service（D-Bus） | 無ければ `--store file` |
 
 ## ビルド
 
-```powershell
+```bash
 cargo build --release
-```
 
-WinFsp マウントを含める場合:
-
-```powershell
-cargo +stable-x86_64-pc-windows-msvc build --release -p terabox-cli `
+# Windows で WinFsp 込み
+cargo +stable-x86_64-pc-windows-msvc build --release -p terabox-cli \
   --features winfsp-backend --target x86_64-pc-windows-msvc
+
+# Linux / macOS で FUSE 込み
+cargo build --release -p terabox-cli --features fuse-backend
 ```
 
 `winfsp-x64.dll` を exe と同じ場所へ置くか、WinFsp の `bin` を PATH に足す。
 無いと起動時に 1285 で終了する。
 
+musl で静的ビルドする場合は資格情報ストアを積まない（D-Bus の静的リンクが
+現実的でない）。`tbx login --store file` を使う。
+
+```bash
+cargo build --release -p terabox-cli --target x86_64-unknown-linux-musl
+```
+
 ## 使い方
 
-```powershell
+```bash
 tbx login                       # ブラウザが開く。ログインすると自動で閉じる
+tbx login --name work           # 2 つ目以降のアカウントを追加
+tbx accounts                    # 登録済みの一覧（* が既定、> が使用中）
+tbx use work                    # 既定を切り替え
+tbx --account work ls /         # この 1 回だけ別アカウントで
 tbx doctor                      # 環境と接続の診断
 tbx ls /                        # 一覧
-tbx quota                       # 容量・VIP・上限
-tbx get "/a/b.bin" -o D:\dl     # 分割ダウンロード（中断しても再実行で再開）
-tbx put .\big.iso --remote /bk  # 分割アップロード
+tbx quota                       # 容量・無料枠の内訳・期限
+tbx get "/a/b.bin" -o ./dl      # 分割ダウンロード（中断しても再実行で再開）
+tbx get "/photos" -o ./photos   # フォルダ一括（--jobs で同時数）
+tbx put ./big.iso --remote /bk  # 分割アップロード
 tbx share "https://www.terabox.com/s/1xxxx" --save
 tbx play "/Movies/a.mp4"
-tbx mount T:                    # WinFsp があれば WinFsp、無ければ WebDAV
+tbx mount T:                    # Windows: WinFsp（無ければ WebDAV）
+tbx mount ~/tbx                 # Linux: FUSE（無ければ WebDAV）
 tbx tui
 ```
 
 すべてのコマンドは `--json` で機械可読な出力になる。
+
+### 複数アカウント
+
+アカウント名は英数字・`_`・`-` の 32 文字まで。解決順は
+`--account` > 環境変数 `TBX_ACCOUNT` > 索引の既定 > `default` の順。
+
+- 秘密は OS の資格情報ストア（`account:<名前>`）に置く。
+- `--store file` を明示したときだけ `secrets/<名前>.json` に 0600 で書く。
+  権限が緩いファイルは読む前に拒否する。
+- 台帳は `state-<名前>.db` に分かれる。アカウントを跨いでレジューム状態が
+  混ざらない。
+- 旧版の `session` 1 件は、初回に `default` として自動で引き継ぐ。
 
 ## 構成
 
 ```
 crates/
   terabox-core/   API クライアント・セッション・転送エンジン・台帳・VFS 抽象
-  terabox-cli/    bin `tbx`（サブコマンド、ログイン、診断）
+  terabox-cli/    bin `tbx`（サブコマンド、ログイン、アカウント、診断、走査）
   terabox-tui/    ratatui の画面
-  terabox-mount/  WinFsp / WebDAV バックエンド
+  terabox-mount/  WinFsp / FUSE / WebDAV バックエンド
 docs/
   protocol.md     解析結果と根拠（Evidence ID 付き）
   limitations.md  未確定事項と制約
 analysis/         REA の出力（JSON）と DEX 文字列
 tools/            REA 用の JDK・JADX と環境設定スクリプト
+.github/workflows CI とタグ連動リリース
 .agents/skills/   このプロジェクト用のスキル
 ```
 
-`terabox-core` は TUI にも Windows API にも依存しない。CLI・TUI・マウントは
+`terabox-core` は TUI にも OS 固有 API にも依存しない。CLI・TUI・マウントは
 すべてこのコアを共有する。
 
 ## 設計上の判断
@@ -86,40 +119,65 @@ tools/            REA 用の JDK・JADX と環境設定スクリプト
 公式アプリの API にはネイティブ署名（`libnetdisk-security-rand.so` の
 `get_signature_md5`）が必要な経路がある。署名生成を再実装すると難読化との
 イタチごっこになり保守できないため、署名不要の Web API だけを使う。
-`/api/streaming` は対象外。
+`/api/streaming` と `/share/streaming` は対象外。
 
 **トークンは HTML から取る。**
-`/main` の HTML に `jsToken`（192 桁 hex）と `templateData`（`bdstoken` / `uk`）が
+`/main` の HTML に `jsToken` と `templateData`（`bdstoken` / `uk`）が
 埋まっている。JS を実行せず正規表現で取り出す。構造が変われば明示的に失敗する。
 
-**秘密情報は資格情報マネージャだけに置く。**
+**秘密情報は OS の資格情報ストアだけに置く。**
 設定ファイルにも台帳 DB にも書かない。`Session` の `Debug` は値を伏せる。
+平文保存は明示指定時のみで、既定にはしない。
 
 **サーバが返さない値を作らない。**
-単一ファイル上限・同時接続数・解像度は、取得できたときだけ表示する。
-未取得は「未取得」と出す。
+単一ファイル上限・同時接続数・VIP 状態は、取得できたときだけ表示する。
+未取得は「未取得」と出す。マウントの容量も取れなければ 0（不明）を返す。
 
 ## マウントの使い方
 
-```powershell
+```bash
+# Windows
 tbx mount T: --mode winfsp     # WinFsp がある環境（推奨）
 tbx mount T: --mode webdav     # インストーラ不要のフォールバック
 tbx mount T:                   # auto: WinFsp があれば WinFsp、無ければ WebDAV
+
+# Linux / macOS
+tbx mount ~/tbx --mode fuse    # FUSE（--features fuse-backend が要る）
+tbx mount ~/tbx --mode webdav  # WebDAV サーバだけ立てる
+tbx mount ~/tbx                # auto: FUSE が使えれば FUSE、無ければ WebDAV
 ```
 
 `--mode winfsp` は MSVC ターゲットでビルドした `tbx` が必要。
 `winfsp-x64.dll` を exe の隣に置くか、WinFsp の `bin` を PATH に足す。
 
-読み取り（一覧・ダウンロード）、フォルダ作成・削除、ファイル書き込み・上書きは
-実アカウントで動作確認済み。ただし一定量の書き込み後、サーバが書き込み系 API に
-`need verify`（`errno 4000023` / `450016`）を返す状態になる。解除条件は未特定で、
-クライアントからは解除できない。この状態ではマウントの書き込みが
-**失敗として返る**（黙って成功を装わない）。詳細は `docs/limitations.md`。
+`--mode fuse` は `fusermount3` と `/dev/fuse` が必要（実測: 無いと
+`No such file or directory` で失敗する）。Unix の WebDAV モードは
+接続コマンドを実行せず、URL と使える手段だけを表示する（`davfs2` は
+root 権限と `/etc/fstab` を要求するため、勝手に走らせない）。
+
+Windows の WinFsp、Linux の FUSE とも、一覧・読み出し・書き込み・上書き・
+フォルダ作成/削除を実アカウントで確認済み。書き込みは API が全体置換しか
+提供しないため、開いたハンドルごとにバッファへ溜めて閉じるときに 1 回送る。
+失敗は `flush` / `release` から返す（黙って成功を装わない）。
+
+## リリース
+
+`v*` タグを push すると、4 ターゲットのビルドが走り Release に添付される。
+
+| ターゲット | ランナー |
+|---|---|
+| `x86_64-pc-windows-msvc`（WinFsp 込み） | `windows-latest` |
+| `x86_64-unknown-linux-gnu`（FUSE 込み） | `ubuntu-latest` |
+| `x86_64-unknown-linux-musl` | `ubuntu-latest` |
+| `aarch64-unknown-linux-gnu`（FUSE 込み） | `ubuntu-24.04-arm` |
+
+タグと `Cargo.toml` の版が一致しないと失敗する。WinFsp の DLL は
+ライセンスの都合で同梱しない（利用者が WinFsp を導入する）。
 
 ## テスト
 
-```powershell
-cargo test --workspace
+```bash
+cargo test --workspace --bins --lib
 cargo test -p terabox-core --test live_anonymous -- --ignored --nocapture
 ```
 
@@ -132,3 +190,4 @@ cargo test -p terabox-core --test live_anonymous -- --ignored --nocapture
   機密文書の保管先には向かない。この性質はクライアントでは変えられない。
 - API は非公開で予告なく変わる。`docs/limitations.md` に未確定事項をまとめてある。
 - WebDAV は `127.0.0.1` のみで待ち受ける。外部へ公開しない。
+- 無料枠は恒久 30GiB と期間限定 994GiB の合計で、期限がある（実測）。

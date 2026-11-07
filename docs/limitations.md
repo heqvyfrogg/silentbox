@@ -18,18 +18,22 @@
 | `PreCreateDataBean.returnType == 2` | 「重複排除」と推定 | 誤推定なら送信をスキップして失敗する |
 | `partseq` の起点 | 0 始まりと仮定 | 1 始まりなら初回アップロードが失敗する |
 | 推奨パートサイズ | 4MiB と仮定 | 大きすぎると失敗、小さすぎると低速 |
-| 共有リンク内の直接ダウンロード | `share_dlink` はパスを返すだけで、`pcs/file` で解決できるか未確認 | 共有内ファイルの直接 DL は未対応 |
+| 共有リンク内の直接ダウンロード | `/share/create` は HTTP 405。共有内の dlink は署名必須の `/share/streaming` 経由でしか引けない | 共有は一覧表示と領域への保存まで（直接 DL は作らない） |
 
 ## 実装していない機能
 
 - **署名必須 API**（`/api/streaming`, `/share/streaming`）。ネイティブの
   `get_signature_md5` と `libnetapi-security-rand` に依存するため再実装しない。
+  共有リンクの**中身を直接ダウンロードする経路はこれに依存するため作らない**。
+  実測: `/share/create` は `www.terabox.com` でも `/api/share/create` でも
+  HTTP 405 だった。共有内の dlink を引く手段が署名必須の `/share/streaming`
+  だけなので、共有は「一覧表示」と「自分の領域へ保存」までとする。
 - **QR ログイン**。エンドポイント未特定のため。
-- **フォルダ一括ダウンロード**。`tbx get` は単一ファイルのみ。
+- **フォルダ改名**。`opera=rename` は 6 通りのパラメータ形すべてで `errno 2`。
+  ファイルは読み出し→再アップロード→削除で代替するが、フォルダは未対応。
 - **部分書き込み・サイズ変更**（マウント経由）。TeraBox の API はオブジェクト
-  全体の置き換えしか提供しないため、明示的に拒否する。
+  全体の置き換えしか提供しないため、開いたハンドル全体を送り直す。
 - **オフラインキャッシュ**。マウントは毎回サーバへ取りに行く（一覧は 15 秒キャッシュ）。
-- **複数アカウントの同時保持**。資格情報は 1 件だけ。
 
 ## ビルドと実行の制約
 
@@ -176,10 +180,47 @@ TeraBox の API は非公開で、予告なく変わる。
 
 ## 検証していない範囲
 
-- 実際のアカウントでのログイン、一覧取得、アップロード、共有保存
-- 実ファイル転送の速度と安定性
-- WinFsp マウントの実動作（エクスプローラからの読み書き）
-- WebDAV の `net use` 接続（`net use` は環境依存のため未実行）
-- TUI の実端末での描画
+- **共有リンクの解決**。有効な共有 URL を用意していないため、実 URL での
+  一覧取得と保存は未実施（不正 URL の `errno 105` は実測済み）。共有の作成は
+  `/share/create` `/api/share/create` とも HTTP 405 で作れないため、
+  自分で作ったリンクでの確認もできていない。
+- **WebDAV の `net use` 接続**。Windows の `WebClient` は停止中で、非管理者では
+  起動できない（実測: `Cannot open WebClient service`）。Windows の WebDAV
+  クライアントは Basic 認証を要求するが、実装は認証を持たない。
+- **TUI の実端末での描画**。作業環境が非対話のため確認できない。共有ペインの
+  入力・解決は実装済みだが、端末での見た目は未確認。
+- **aarch64 の実行**。CI のランナーでビルドするだけで、実機での起動は未確認。
+- **musl ビルドの資格情報ストア**。musl では keyring を積まないため、
+  `--store file` が必須。この経路の実機確認は x86_64-gnu のみ。
+
+アカウントでのログイン・一覧・ダウンロード・アップロード・削除・復元・
+フォルダ一括取得・複数アカウントの切替は実測済み。Windows の WinFsp と
+Linux の FUSE はマウント・読み書き・statfs まで実測済み。
 
 これらは初回の実ログイン後に確認し、結果をこの文書へ追記する。
+
+## 2026-11-07 実測: Linux の FUSE
+
+Debian 13（`6.12.113+deb13-amd64`）実機で `tbx mount ~/mnt --mode fuse` を実行し、
+以下を実測した。
+
+| 項目 | 結果 |
+|---|---|
+| マウント | 成功（`silentbox on /tmp/fusemnt type fuse (rw,nosuid,nodev,relatime,user_id=1001,default_permissions)`） |
+| 一覧 | 成功（`TeraBox初心者ガイド.pdf` が出た） |
+| 読み出し | 成功（5,364,374 バイトを `cp` で取得、先頭 `%PDF-`） |
+| 書き込み | 成功（`hello from linux fuse` を書き、サーバ側の一覧にも 22 B で反映） |
+| `statfs` | 実値（Blocks Total 268,435,456 × 4 KiB = 1 TiB、Free 268,434,146） |
+
+### 実測で判明した制約
+
+- `fusermount3` が無いと `No such file or directory (os error 2)` で失敗する。
+  `fuse3` パッケージの導入が要る（`/dev/fuse` だけでは足りない）。
+- `MountOption::AutoUnmount` は `acl != Owner` を要求する。既定の `Owner` のまま
+  付けると `auto_unmount requires acl != Owner` でマウントできない。実装では
+  付けていない。
+- `Config` は `non_exhaustive` なので構造体リテラルで組み立てられない。
+  既定を作って項目を差し替える。
+- 資格情報ストア（Secret Service）が無い環境では
+  `Platform secure storage failure: DBus error: The name org.freedesktop.secrets
+  was not provided by any .service files` になる。`--store file` を使う。

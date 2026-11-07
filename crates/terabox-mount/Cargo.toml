@@ -25,11 +25,13 @@ urlencoding.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 winfsp = { version = "0.13", optional = true }
-wincs = { version = "0.1", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+fuser = { version = "0.18", optional = true }
 
 [features]
 default = []
 # WinFsp バックエンド。MSVC ターゲットでのみ実用的にビルドできる（実測）。
 winfsp-backend = ["dep:winfsp"]
-# Windows Cloud Filter (cfapi) バックエンド。インストーラ不要。
-cfapi-backend = ["dep:wincs"]
+# Linux / macOS の FUSE バックエンド。libfuse は使わず純 Rust の fuser で実装する。
+fuse-backend = ["dep:fuser"]

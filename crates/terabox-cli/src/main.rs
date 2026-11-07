@@ -3,10 +3,12 @@
 //! 標準出力はデータ、標準エラーは進捗とメッセージ。`--json` を付けた場合は
 //! 標準出力に JSON だけを出す（パイプで使えるようにする）。
 
+mod accounts;
 mod cdp;
-mod credentials;
 mod format;
 mod login;
+mod secret;
+mod walk;
 mod which;
 
 use std::path::PathBuf;
@@ -34,6 +36,10 @@ struct Cli {
     #[arg(long, global = true, env = "TBX_HOME")]
     home: Option<PathBuf>,
 
+    /// 使うアカウント名。未指定なら索引の既定、それも無ければ `default`。
+    #[arg(long, global = true, env = "TBX_ACCOUNT")]
+    account: Option<String>,
+
     /// 機械可読な JSON を標準出力へ出す。
     #[arg(long, global = true)]
     json: bool,
@@ -59,10 +65,29 @@ enum Command {
         /// ブラウザのユーザーデータディレクトリ。
         #[arg(long)]
         profile: Option<PathBuf>,
+        /// 登録するアカウント名。省略時は `--account` の解決結果。
+        #[arg(long)]
+        name: Option<String>,
+        /// 秘密の保存先（keyring / file）。省略時は自動。
+        #[arg(long)]
+        store: Option<String>,
     },
     /// 保存済みセッションを削除する。
-    Logout,
-    /// 現在のアカウント・容量・VIP 状態を表示する。
+    Logout {
+        /// 削除するアカウント名。省略時は現在のアカウントだけ。
+        name: Option<String>,
+        /// 登録済みを全部消す。
+        #[arg(long)]
+        all: bool,
+    },
+    /// 登録済みのアカウントを一覧する。
+    Accounts,
+    /// 既定で使うアカウントを切り替える。
+    Use {
+        /// 切り替え先の名前。
+        name: String,
+    },
+    /// ログイン済みのアカウントを一覧する。
     Whoami,
     /// リモートの一覧を表示する。
     Ls {
@@ -86,12 +111,12 @@ enum Command {
     Quota,
     /// ファイルをダウンロードする。
     Get {
-        /// リモートの絶対パス。
+        /// リモートの絶対パス。フォルダを指定すると中身をまとめて取る。
         path: String,
         /// 保存先ディレクトリ（既定は設定の download_dir）。
         #[arg(short, long)]
         output: Option<PathBuf>,
-        /// 保存ファイル名の上書き。
+        /// 保存ファイル名の上書き（単一ファイルのときのみ）。
         #[arg(long)]
         name: Option<String>,
         /// 分割接続数。
@@ -100,6 +125,9 @@ enum Command {
         /// 既存ファイルがあっても最初から取り直す。
         #[arg(long)]
         restart: bool,
+        /// フォルダ取得時に同時に落とすファイル数。
+        #[arg(long, default_value_t = 2)]
+        jobs: usize,
     },
     /// ファイルをアップロードする。
     Put {
@@ -151,8 +179,9 @@ enum Command {
     },
     /// ドライブとしてマウントする。
     Mount {
-        /// ドライブレター（例: `T:`）。
-        drive: String,
+        /// マウント先。Windows はドライブレター（例: `T:`）、
+        /// Linux / macOS はディレクトリのパス（例: `~/tbx`）。
+        target: String,
         /// バックエンド。
         #[arg(long, value_enum, default_value_t = MountMode::Auto)]
         mode: MountMode,
@@ -196,11 +225,13 @@ enum TrashAction {
 
 #[derive(Copy, Clone, Debug, ValueEnum)]
 enum MountMode {
-    /// WinFsp があれば使い、無ければ WebDAV に切り替える。
+    /// その OS で最も自然な方式を選ぶ（Windows は WinFsp、Unix は FUSE）。
     Auto,
-    /// WinFsp を使う。
+    /// WinFsp を使う（Windows のみ）。
     Winfsp,
-    /// WebDAV を使う。
+    /// FUSE を使う（Linux / macOS のみ）。
+    Fuse,
+    /// WebDAV を使う（全 OS）。
     Webdav,
 }
 
@@ -210,6 +241,12 @@ fn main() -> Result<()> {
     if let Some(home) = &cli.home {
         std::env::set_var("TBX_HOME", home);
     }
+
+    // アカウント名を 1 回だけ解決し、以降は環境変数から読む。下位モジュールが
+    // 独自に解釈しないよう、決定はここで閉じる。
+    let home = terabox_core::config::tbx_home();
+    let account = accounts::resolve(&home, cli.account.as_deref()).map_err(|e| anyhow!(e))?;
+    std::env::set_var("TBX_ACCOUNT", &account);
 
     let filter = if cli.verbose {
         "tbx=debug,terabox_core=debug"
@@ -237,8 +274,12 @@ async fn run(cli: Cli) -> Result<()> {
             paste,
             port,
             profile,
-        } => cmd_login(paste, port, profile, json).await,
-        Command::Logout => cmd_logout(json),
+            name,
+            store,
+        } => cmd_login(paste, port, profile, name, store, json).await,
+        Command::Logout { name, all } => cmd_logout(name, all, json),
+        Command::Accounts => cmd_accounts(json),
+        Command::Use { name } => cmd_use(&name, json),
         Command::Whoami => cmd_whoami(json).await,
         Command::Ls {
             path,
@@ -254,7 +295,8 @@ async fn run(cli: Cli) -> Result<()> {
             name,
             conn,
             restart,
-        } => cmd_get(&path, output, name, conn, restart, json).await,
+            jobs,
+        } => cmd_get(&path, output, name, conn, restart, jobs, json).await,
         Command::Put { local, remote, name } => cmd_put(local, &remote, name, json).await,
         Command::Share { url, save, dest } => cmd_share(&url, save, &dest, json).await,
         Command::Play {
@@ -265,7 +307,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Trash { action } => cmd_trash(action, json).await,
         Command::Rm { paths } => cmd_rm(&paths, json).await,
         Command::Mkdir { path } => cmd_mkdir(&path, json).await,
-        Command::Mount { drive, mode, port } => cmd_mount(&drive, mode, port).await,
+        Command::Mount { target, mode, port } => cmd_mount(&target, mode, port).await,
         Command::Tui => cmd_tui().await,
         Command::Doctor => cmd_doctor(json).await,
         Command::Transfers => cmd_transfers(json),
@@ -276,12 +318,91 @@ fn config() -> Result<Config> {
     Config::load().map_err(|e| anyhow!(e))
 }
 
+/// 現在のアカウント名（`main` が解決済み）。
+fn account_name() -> String {
+    terabox_core::config::account_name()
+}
+
 fn load_session() -> Result<Session> {
-    match credentials::load() {
-        Ok(Some(s)) => Ok(s),
-        Ok(None) => bail!("保存済みセッションがありません。`tbx login` を実行してください。"),
+    let home = terabox_core::config::tbx_home();
+    let account = account_name();
+    // 旧版の 1 件だけのセッションを、初回だけ `default` へ移す。
+    migrate_legacy_once(&home, &account)?;
+    let kind = secret::detect_kind(&home, &account);
+    match secret::load(&home, &account, kind) {
+        Ok(Some(s)) => {
+            // 索引に載っていなければ載せる。移行の途中で落ちた場合や、
+            // 索引だけ消えた場合に `accounts` が空のままになるのを防ぐ。
+            ensure_indexed(&home, &account, s.uk.clone())?;
+            Ok(s)
+        }
+        Ok(None) => bail!(
+            "アカウント {account} の保存済みセッションがありません。`tbx login --name {account}` を実行してください。"
+        ),
         Err(e) => bail!("{e}"),
     }
+}
+
+/// 索引に載っていなければ載せる（既にあれば触らない）。
+fn ensure_indexed(
+    home: &std::path::Path,
+    account: &str,
+    uk: Option<String>,
+) -> Result<()> {
+    let mut index = accounts::load(home).map_err(|e| anyhow!(e))?;
+    if index.find(account).is_some() {
+        return Ok(());
+    }
+    index.upsert(account, uk, chrono::Utc::now().timestamp());
+    if index.current.is_empty() {
+        index.current = account.to_string();
+    }
+    accounts::save(home, &index).map_err(|e| anyhow!(e))
+}
+
+/// 旧版の `session` エントリを `default` へ移す。
+///
+/// 新しいスロットへの保存が成功した後にだけ旧エントリを消す。失敗したら旧を
+/// 残す（移行の途中でセッションを失わない）。2 回目以降は旧が無いので何もしない。
+fn migrate_legacy_once(home: &std::path::Path, account: &str) -> Result<()> {
+    if !account_matches_legacy(account) {
+        return Ok(());
+    }
+    if !secret::has_legacy() {
+        return Ok(());
+    }
+    // 既に新しいスロットがあるなら移行済み。旧だけ消す。
+    if secret::load(home, account, secret::detect_kind(home, account)).ok().flatten().is_some() {
+        let _ = secret::delete_legacy();
+        return Ok(());
+    }
+    let legacy = match secret::load_legacy() {
+        Ok(Some(s)) => s,
+        Ok(None) => return Ok(()),
+        Err(_) => return Ok(()),
+    };
+    match secret::save(home, account, secret::StoreKind::Keyring, &legacy) {
+        Ok(()) => {
+            let _ = secret::delete_legacy();
+            // 索引にも載せる。載せないと `tbx accounts` に出てこない。
+            let mut index = accounts::load(home).map_err(|e| anyhow!(e))?;
+            index.upsert(account, legacy.uk.clone(), chrono::Utc::now().timestamp());
+            if index.current.is_empty() {
+                index.current = account.to_string();
+            }
+            accounts::save(home, &index).map_err(|e| anyhow!(e))?;
+            eprintln!("旧形式のセッションをアカウント {account} として引き継ぎました。");
+        }
+        Err(e) => {
+            eprintln!("旧形式のセッションを引き継げませんでした（旧はそのまま残します）: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// 移行の対象になるのは既定名のときだけ。他の名前へ勝手に配らない。
+fn account_matches_legacy(account: &str) -> bool {
+    account == accounts::DEFAULT_NAME
 }
 
 async fn api() -> Result<ApiClient> {
@@ -301,10 +422,30 @@ fn map_session_error(e: TbxError) -> anyhow::Error {
 
 // ---- 各コマンド ----
 
-async fn cmd_login(paste: bool, port: u16, profile: Option<PathBuf>, json: bool) -> Result<()> {
+async fn cmd_login(
+    paste: bool,
+    port: u16,
+    profile: Option<PathBuf>,
+    name: Option<String>,
+    store: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let home = terabox_core::config::tbx_home();
+    let target = match name {
+        Some(n) => {
+            accounts::validate_name(&n).map_err(|e| anyhow!(e))?;
+            n
+        }
+        None => account_name(),
+    };
+    let kind = match store {
+        Some(s) => secret::StoreKind::parse(&s).map_err(|e| anyhow!(e))?,
+        None => secret::StoreKind::Keyring,
+    };
+
     let mut from_browser = None;
     if !paste {
-        let profile = profile.unwrap_or_else(default_profile_dir);
+        let profile = profile.unwrap_or_else(|| default_profile_dir(&target));
         match login::login_with_browser(profile, port).await {
             login::BrowserLogin::Success(session) => from_browser = Some(session),
             login::BrowserLogin::NotLoggedIn => {
@@ -329,25 +470,42 @@ async fn cmd_login(paste: bool, port: u16, profile: Option<PathBuf>, json: bool)
         }
     };
 
-    match credentials::save(&session) {
-        credentials::SaveOutcome::Saved => {}
-        credentials::SaveOutcome::Unavailable(reason) => {
-            eprintln!("警告: {reason}");
-            eprintln!("このセッションは保存されていません。次の実行では再ログインが必要です。");
-        }
+    if let Err(e) = secret::save(&home, &target, kind, &session) {
+        eprintln!("警告: {e}");
+        eprintln!("このセッションは保存されていません。次の実行では再ログインが必要です。");
+        bail!("アカウント {target} を保存できませんでした");
     }
+
+    // 索引を更新する。保存に成功した後だけ載せる（載せたのに読めない状態を作らない）。
+    let mut index = accounts::load(&home).map_err(|e| anyhow!(e))?;
+    let was_new = index.upsert(&target, session.uk.clone(), chrono::Utc::now().timestamp());
+    if index.current.is_empty() {
+        index.current = target.clone();
+    }
+    accounts::save(&home, &index).map_err(|e| anyhow!(e))?;
 
     if json {
         println!(
             "{}",
             serde_json::json!({
                 "logged_in": true,
-                "account": session.account_label(),
+                "name": target,
+                "server_account": session.account_label(),
                 "can_write": session.can_write(),
+                "store": kind.label(),
+                "new": was_new,
             })
         );
     } else {
-        println!("ログインしました（{}）", session.account_label());
+        if was_new {
+            println!("アカウント {target} を追加しました（{}）", session.account_label());
+        } else {
+            println!(
+                "アカウント {target} のセッションを更新しました（{}）",
+                session.account_label()
+            );
+        }
+        println!("保存先: {}", kind.label());
         if !session.can_write() {
             println!(
                 "注意: 書き込み用トークン（bdstoken）が取得できていません。アップロードや削除は失敗します。"
@@ -383,33 +541,129 @@ async fn paste_login_interactive() -> Result<Session> {
         .map_err(|e| anyhow!("{e}"))
 }
 
-fn default_profile_dir() -> PathBuf {
-    terabox_core::config::tbx_home().join("browser-profile")
+fn default_profile_dir(account: &str) -> PathBuf {
+    terabox_core::config::tbx_home()
+        .join("browser-profile")
+        .join(account)
 }
 
-fn cmd_logout(json: bool) -> Result<()> {
-    match credentials::delete() {
-        Ok(true) => {
+fn cmd_logout(name: Option<String>, all: bool, json: bool) -> Result<()> {
+    let home = terabox_core::config::tbx_home();
+    let mut index = accounts::load(&home).map_err(|e| anyhow!(e))?;
+
+    if all {
+        let names: Vec<String> = index.accounts.iter().map(|a| a.name.clone()).collect();
+        if names.is_empty() {
             if json {
-                println!("{}", serde_json::json!({"logged_out": true}));
+                println!("{}", serde_json::json!({"logged_out": false, "reason": "no account"}));
             } else {
-                println!("保存済みセッションを削除しました。");
+                println!("登録済みのアカウントはありません。");
             }
-            Ok(())
+            return Ok(());
         }
-        Ok(false) => {
-            if json {
-                println!(
-                    "{}",
-                    serde_json::json!({"logged_out": false, "reason": "no session"})
-                );
-            } else {
-                println!("保存済みセッションはありませんでした。");
+        let mut removed = Vec::new();
+        for entry_name in &names {
+            let kind = secret::detect_kind(&home, entry_name);
+            match secret::delete(&home, entry_name, kind) {
+                Ok(true) => removed.push(entry_name.clone()),
+                Ok(false) => {}
+                Err(e) => eprintln!("アカウント {entry_name} を消せませんでした: {e}"),
             }
-            Ok(())
+            index.remove(entry_name);
         }
-        Err(e) => bail!("{e}"),
+        index.current.clear();
+        accounts::save(&home, &index).map_err(|e| anyhow!(e))?;
+        if json {
+            println!("{}", serde_json::json!({"logged_out": true, "removed": removed}));
+        } else {
+            println!("{} 件のアカウントを削除しました。", removed.len());
+        }
+        return Ok(());
     }
+
+    let target = match name {
+        Some(n) => {
+            accounts::validate_name(&n).map_err(|e| anyhow!(e))?;
+            n
+        }
+        None => account_name(),
+    };
+    let kind = secret::detect_kind(&home, &target);
+    let deleted = secret::delete(&home, &target, kind).map_err(|e| anyhow!(e))?;
+    let removed_from_index = index.remove(&target);
+    accounts::save(&home, &index).map_err(|e| anyhow!(e))?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "logged_out": deleted || removed_from_index,
+                "name": target,
+                "current": index.current,
+            })
+        );
+    } else if deleted || removed_from_index {
+        println!("アカウント {target} を削除しました。");
+        if !index.current.is_empty() {
+            println!("既定は {} に移りました。", index.current);
+        }
+    } else {
+        println!("アカウント {target} は登録されていませんでした。");
+    }
+    Ok(())
+}
+
+fn cmd_accounts(json: bool) -> Result<()> {
+    let home = terabox_core::config::tbx_home();
+    let index = accounts::load(&home).map_err(|e| anyhow!(e))?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&index)?);
+        return Ok(());
+    }
+
+    if index.accounts.is_empty() {
+        println!("登録済みのアカウントはありません。`tbx login --name <名前>` で追加してください。");
+        return Ok(());
+    }
+    let active = account_name();
+    println!(
+        "{:<4} {:<16} {:<16} {}",
+        "", "名前", "uk", "登録時刻"
+    );
+    for entry in &index.accounts {
+        let marks = [
+            if entry.name == index.current { "*" } else { " " },
+            if entry.name == active { ">" } else { " " },
+        ]
+        .concat();
+        let when = chrono::DateTime::from_timestamp(entry.added_at, 0)
+            .map(|d| d.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M").to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<4} {:<16} {:<16} {}",
+            marks,
+            entry.name,
+            entry.uk.as_deref().unwrap_or("-"),
+            when
+        );
+    }
+    println!();
+    println!("* = 既定 / > = このコマンドで使用中");
+    Ok(())
+}
+
+fn cmd_use(name: &str, json: bool) -> Result<()> {
+    let home = terabox_core::config::tbx_home();
+    let mut index = accounts::load(&home).map_err(|e| anyhow!(e))?;
+    index.set_current(name).map_err(|e| anyhow!(e))?;
+    accounts::save(&home, &index).map_err(|e| anyhow!(e))?;
+    if json {
+        println!("{}", serde_json::json!({"current": index.current}));
+    } else {
+        println!("既定のアカウントを {name} にしました。");
+    }
+    Ok(())
 }
 
 async fn cmd_whoami(json: bool) -> Result<()> {
@@ -491,34 +745,57 @@ async fn cmd_get(
     name: Option<String>,
     conn: Option<u8>,
     restart: bool,
+    jobs: usize,
     json: bool,
 ) -> Result<()> {
     let client = api().await?;
     let cfg = config()?;
     let normalized = terabox_core::vfs::normalize_path(path);
-    let file_name = name.unwrap_or_else(|| terabox_core::vfs::base_name(&normalized));
-    if file_name.is_empty() {
-        bail!("ダウンロードするファイル名を決められません。`--name` で指定してください。");
-    }
 
-    // メタ情報からサイズと fs_id を得る。取得できなくても dlink で進める。
-    let meta = client
-        .list(
-            &terabox_core::vfs::parent_path(&normalized),
-            1,
-            1000,
-            "name",
-            false,
-        )
+    // 指定がフォルダなら一括取得へ回す。判定は「親の一覧に載っているか」で行う。
+    let target_name = name
+        .clone()
+        .unwrap_or_else(|| terabox_core::vfs::base_name(&normalized));
+    let parent = terabox_core::vfs::parent_path(&normalized);
+    let entries = client
+        .list(&parent, 1, 1000, "name", false)
         .await
-        .ok()
-        .and_then(|resp| resp.list.into_iter().find(|e| e.display_name() == file_name));
+        .map_err(map_session_error)?;
+    let found = entries
+        .list
+        .iter()
+        .find(|e| e.display_name() == target_name)
+        .cloned();
 
-    if let Some(entry) = &meta {
+    if let Some(entry) = &found {
         if entry.isdir {
-            bail!("{normalized} はフォルダです。フォルダ一括取得は未対応です。");
+            if name.is_some() {
+                bail!("フォルダに `--name` は使えません。`--output` で保存先を指定してください。");
+            }
+            let dest_root = output.unwrap_or_else(|| {
+                cfg.download_dir
+                    .join(terabox_core::vfs::base_name(&normalized))
+            });
+            return download_folder(
+                &client,
+                &normalized,
+                &dest_root,
+                conn,
+                restart,
+                jobs.max(1),
+                json,
+            )
+            .await;
         }
     }
+
+    let file_name = if target_name.is_empty() {
+        bail!("ダウンロードするファイル名を決められません。`--name` で指定してください。");
+    } else {
+        target_name
+    };
+
+    let meta = found;
 
     let dest_dir = output.unwrap_or(cfg.download_dir.clone());
     std::fs::create_dir_all(&dest_dir)?;
@@ -586,6 +863,179 @@ async fn cmd_get(
                 format::bytes(done.resumed_from)
             );
         }
+    }
+    Ok(())
+}
+
+/// フォルダを再帰的に辿り、配下のファイルをすべて落とす。
+async fn download_folder(
+    client: &ApiClient,
+    root: &str,
+    dest_root: &std::path::Path,
+    conn: Option<u8>,
+    restart: bool,
+    jobs: usize,
+    json: bool,
+) -> Result<()> {
+    let cfg = config()?;
+    let mut plan = walk::Plan::default();
+
+    // 幅優先で辿る。1 ディレクトリ 1000 件ずつページを送る。
+    let mut queue: Vec<Vec<String>> = vec![Vec::new()];
+    while let Some(current) = queue.pop() {
+        let remote = if current.is_empty() {
+            root.to_string()
+        } else {
+            format!("{}/{}", root.trim_end_matches('/'), current.join("/"))
+        };
+        let mut page = 1;
+        loop {
+            let resp = client
+                .list(&remote, page, 1000, "name", false)
+                .await
+                .map_err(map_session_error)?;
+            if resp.list.is_empty() {
+                break;
+            }
+            walk::extend(&mut plan, &current, &resp.list);
+            let has_more = resp.has_more.unwrap_or(0) != 0;
+            if !has_more {
+                break;
+            }
+            page += 1;
+        }
+        // 子ディレクトリを積む（深さ優先で回るが、並べ替えで順序を直す）。
+        for dir in &plan.dirs {
+            if dir.relative_dirs.len() == current.len() + 1
+                && dir.relative_dirs[..current.len()] == current[..]
+            {
+                queue.push(dir.relative_dirs.clone());
+            }
+        }
+    }
+    walk::sort(&mut plan);
+
+    if plan.files.is_empty() && plan.dirs.is_empty() {
+        println!("{root} は空です。");
+        return Ok(());
+    }
+
+    for dir in &plan.dirs {
+        let mut path = dest_root.to_path_buf();
+        for part in &dir.relative_dirs {
+            path.push(part);
+        }
+        std::fs::create_dir_all(&path)
+            .with_context(|| format!("{} を作れませんでした", path.display()))?;
+    }
+
+    let total = plan.files.len();
+    println!(
+        "{} 件のファイルを {} へ取得します（同時 {} 件）。",
+        total,
+        dest_root.display(),
+        jobs
+    );
+
+    let session = client.session().await;
+    let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(jobs));
+    let mut tasks = tokio::task::JoinSet::new();
+    let mut failed: Vec<String> = Vec::new();
+    let mut saved: Vec<(PathBuf, u64)> = Vec::new();
+
+    for file in &plan.files {
+        let permit = semaphore.clone().acquire_owned().await?;
+        let client = client.clone();
+        let session = session.clone();
+        let cfg_conn = conn.unwrap_or(cfg.connections);
+        let part_size = cfg.part_size_bytes();
+        let dest = {
+            let mut p = dest_root.to_path_buf();
+            for part in &file.relative_dirs {
+                p.push(part);
+            }
+            p
+        };
+        let file = file.clone();
+        let restart = restart;
+        tasks.spawn(async move {
+            let _permit = permit;
+            if let Err(e) = std::fs::create_dir_all(&dest) {
+                return Err(format!("{} を作れませんでした: {e}", dest.display()));
+            }
+            let local = dest.join(&file.file_name);
+            if restart && local.exists() {
+                let _ = std::fs::remove_file(&local);
+            }
+            let dlink = client
+                .dlink(&file.remote_path)
+                .await
+                .map_err(|e| format!("{}: {e}", file.remote_path))?;
+            let downloader =
+                Downloader::new(&session).map_err(|e| format!("転送を初期化できません: {e}"))?;
+            let mut ledger = Ledger::open(&terabox_core::config::ledger_path())
+                .map_err(|e| format!("台帳を開けません: {e}"))?;
+            let req = DownloadRequest {
+                remote_path: file.remote_path.clone(),
+                fs_id: file.fs_id.clone(),
+                local_path: local.clone(),
+                expected_size: Some(file.size),
+                connections: cfg_conn,
+                part_size,
+            };
+            let done = downloader
+                .download(&dlink, &req, &mut ledger, |_| {})
+                .await
+                .map_err(|e| format!("{}: {e}", file.remote_path))?;
+            Ok((done.local_path, done.bytes))
+        });
+        while let Some(joined) = tasks.try_join_next() {
+            match joined {
+                Ok(Ok(pair)) => {
+                    eprintln!("  取得: {}", pair.0.display());
+                    saved.push(pair);
+                }
+                Ok(Err(msg)) => failed.push(msg),
+                Err(e) => failed.push(format!("転送タスクが落ちました: {e}")),
+            }
+        }
+    }
+    while let Some(joined) = tasks.join_next().await {
+        match joined {
+            Ok(Ok(pair)) => saved.push(pair),
+            Ok(Err(msg)) => failed.push(msg),
+            Err(e) => failed.push(format!("転送タスクが落ちました: {e}")),
+        }
+    }
+
+    if json {
+        println!(
+            "{}",
+            serde_json::json!({
+                "root": root,
+                "dest": dest_root.display().to_string(),
+                "files": total,
+                "saved": saved.len(),
+                "failed": failed,
+            })
+        );
+    } else {
+        let bytes: u64 = saved.iter().map(|(_, b)| *b).sum();
+        println!(
+            "{} 件中 {} 件を取得しました（{}）。",
+            total,
+            saved.len(),
+            format::bytes(bytes)
+        );
+        if !failed.is_empty() {
+            println!("失敗 {} 件:", failed.len());
+            for msg in &failed {
+                println!("  {msg}");
+            }
+        }
+    }
+    if !failed.is_empty() {
+        bail!("{} 件の取得に失敗しました", failed.len());
     }
     Ok(())
 }
@@ -829,21 +1279,31 @@ async fn cmd_mkdir(path: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_mount(drive: &str, mode: MountMode, port: u16) -> Result<()> {
+async fn cmd_mount(target: &str, mode: MountMode, port: u16) -> Result<()> {
     let client = api().await?;
     let session = client.session().await;
     match mode {
         MountMode::Auto => {
-            if terabox_mount::winfsp_available() {
-                terabox_mount::mount_winfsp(session, drive).await
-            } else {
+            // OS ごとに最も自然な方式を選ぶ。Windows は WinFsp、Unix は FUSE。
+            if cfg!(windows) {
+                if terabox_mount::winfsp_available() {
+                    return terabox_mount::mount_winfsp(session, target).await;
+                }
                 eprintln!("WinFsp が見つからないため WebDAV モードで起動します。");
                 eprintln!("（WinFsp を入れるとエクスプローラの仮想ファイルとして扱えます）");
-                terabox_mount::mount_webdav(session, drive, port).await
+                terabox_mount::mount_webdav(session, target, port).await
+            } else {
+                if terabox_mount::fuse_available() {
+                    return terabox_mount::mount_fuse(session, target).await;
+                }
+                eprintln!("FUSE が使えないため WebDAV モードで起動します。");
+                eprintln!("（--features fuse-backend でビルドし、/dev/fuse を用意してください）");
+                terabox_mount::mount_webdav(session, target, port).await
             }
         }
-        MountMode::Winfsp => terabox_mount::mount_winfsp(session, drive).await,
-        MountMode::Webdav => terabox_mount::mount_webdav(session, drive, port).await,
+        MountMode::Winfsp => terabox_mount::mount_winfsp(session, target).await,
+        MountMode::Fuse => terabox_mount::mount_fuse(session, target).await,
+        MountMode::Webdav => terabox_mount::mount_webdav(session, target, port).await,
     }
 }
 
@@ -907,18 +1367,45 @@ async fn cmd_doctor(json: bool) -> Result<()> {
         Err(e) => checks.push(("設定".into(), false, format!("{e}"))),
     }
 
-    match credentials::load() {
+    let home = terabox_core::config::tbx_home();
+    let account = account_name();
+    let kind = secret::detect_kind(&home, &account);
+    match secret::load(&home, &account, kind) {
         Ok(Some(s)) => checks.push((
             "セッション".into(),
             true,
-            format!("{} / 書き込み {}", s.account_label(), s.can_write()),
+            format!(
+                "アカウント {account}（保存先 {}）/ {} / 書き込み {}",
+                kind.label(),
+                s.account_label(),
+                s.can_write()
+            ),
         )),
         Ok(None) => checks.push((
             "セッション".into(),
             false,
-            "未ログイン（`tbx login` を実行してください）".into(),
+            format!(
+                "アカウント {account} は未ログイン（`tbx login --name {account}` を実行してください）"
+            ),
         )),
         Err(e) => checks.push(("セッション".into(), false, e)),
+    }
+
+    match accounts::load(&home) {
+        Ok(index) => checks.push((
+            "アカウント".into(),
+            true,
+            format!(
+                "{} 件（既定 {}）",
+                index.accounts.len(),
+                if index.current.is_empty() {
+                    "-".to_string()
+                } else {
+                    index.current.clone()
+                }
+            ),
+        )),
+        Err(e) => checks.push(("アカウント".into(), false, e)),
     }
 
     if let Ok(client) = api().await {

@@ -169,34 +169,66 @@ pub struct Browser {
     pub name: &'static str,
 }
 
-/// インストール済みの Chrome / Edge を探す。
+/// インストール済みのブラウザを探す。
 ///
 /// PATH と既知のインストール先だけを見る。ディスク全体の探索はしない。
+/// CDP（`--remote-debugging-port`）を話せるのは Chrome 系だけなので、
+/// Firefox などは候補に入れない。
 pub fn find_browser() -> Option<Browser> {
     let candidates: Vec<(PathBuf, &'static str)> = {
-        let mut v = Vec::new();
-        if let Ok(p) = std::env::var("PROGRAMFILES") {
-            v.push((PathBuf::from(&p).join(r"Google\Chrome\Application\chrome.exe"), "Chrome"));
-            v.push((PathBuf::from(&p).join(r"Microsoft\Edge\Application\msedge.exe"), "Edge"));
+        let mut v: Vec<(PathBuf, &'static str)> = Vec::new();
+        #[cfg(windows)]
+        {
+            if let Ok(p) = std::env::var("PROGRAMFILES") {
+                v.push((PathBuf::from(&p).join(r"Google\Chrome\Application\chrome.exe"), "Chrome"));
+                v.push((PathBuf::from(&p).join(r"Microsoft\Edge\Application\msedge.exe"), "Edge"));
+            }
+            if let Ok(p) = std::env::var("PROGRAMFILES(X86)") {
+                v.push((PathBuf::from(&p).join(r"Google\Chrome\Application\chrome.exe"), "Chrome"));
+                v.push((PathBuf::from(&p).join(r"Microsoft\Edge\Application\msedge.exe"), "Edge"));
+            }
+            if let Ok(p) = std::env::var("LOCALAPPDATA") {
+                v.push((PathBuf::from(&p).join(r"Google\Chrome\Application\chrome.exe"), "Chrome"));
+            }
         }
-        if let Ok(p) = std::env::var("PROGRAMFILES(X86)") {
-            v.push((PathBuf::from(&p).join(r"Google\Chrome\Application\chrome.exe"), "Chrome"));
-            v.push((PathBuf::from(&p).join(r"Microsoft\Edge\Application\msedge.exe"), "Edge"));
-        }
-        if let Ok(p) = std::env::var("LOCALAPPDATA") {
-            v.push((PathBuf::from(&p).join(r"Google\Chrome\Application\chrome.exe"), "Chrome"));
+        #[cfg(target_os = "macos")]
+        {
+            v.push((
+                PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+                "Chrome",
+            ));
+            v.push((
+                PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+                "Edge",
+            ));
+            v.push((
+                PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+                "Chromium",
+            ));
         }
         v
     };
 
     for (path, name) in candidates {
-        if path.exists() {
+        if crate::which::is_executable(&path) {
             return Some(Browser { path, name });
         }
     }
 
-    // PATH 上の `chrome` / `msedge` も見る。
-    for (cmd, name) in [("chrome", "Chrome"), ("msedge", "Edge")] {
+    // PATH 上の実行名も見る。Linux のディストリごとに名前が違うため、
+    // 代表的なものを順に試す。
+    let commands: &[(&str, &str)] = if cfg!(windows) {
+        &[("chrome", "Chrome"), ("msedge", "Edge")]
+    } else {
+        &[
+            ("google-chrome", "Chrome"),
+            ("chromium", "Chromium"),
+            ("chromium-browser", "Chromium"),
+            ("brave-browser", "Brave"),
+            ("microsoft-edge", "Edge"),
+        ]
+    };
+    for (cmd, name) in commands {
         if let Some(found) = crate::which::which(cmd) {
             return Some(Browser { path: found, name });
         }

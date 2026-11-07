@@ -1,0 +1,201 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "成果物を作るが Release は作らない"
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  # タグと Cargo.toml の版が食い違ったまま配布すると、後から追跡できない。
+  # 先に止める。
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        name: 版を確認
+        run: |
+          set -euo pipefail
+          version=$(grep -m1 '^version = ' Cargo.toml | sed -E 's/version = "(.+)"/\1/')
+          echo "Cargo.toml の版: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            echo "タグ: $GITHUB_REF_NAME (版として $tag)"
+            if [ "$tag" != "$version" ]; then
+              echo "タグと Cargo.toml の版が一致しません（$tag != $version）" >&2
+              exit 1
+            fi
+          fi
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+            features: winfsp-backend
+            ext: zip
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            features: fuse-backend
+            ext: tar.gz
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            features: ""
+            ext: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+            features: fuse-backend
+            ext: tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: 依存パッケージ（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
+      - name: ビルド
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -n "${{ matrix.features }}" ]; then
+            cargo build --release -p terabox-cli --features "${{ matrix.features }}" --target "${{ matrix.target }}"
+          else
+            cargo build --release -p terabox-cli --target "${{ matrix.target }}"
+          fi
+
+      - name: 名前を整える
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.check-version.outputs.version }}"
+          target="${{ matrix.target }}"
+          bin="target/$target/release/tbx"
+          if [ "${{ runner.os }}" = "Windows" ]; then bin="$bin.exe"; fi
+          if [ ! -f "$bin" ]; then echo "成果物がありません: $bin" >&2; exit 1; fi
+          out="tbx-$version-$target"
+          mkdir -p "dist/$out"
+          cp "$bin" "dist/$out/"
+          cp README.md CHANGELOG.md "dist/$out/"
+          mkdir -p "dist/$out/docs"
+          cp docs/*.md "dist/$out/docs/"
+          # YAML のブロックスカラー内ではヒアドキュメントの終端を column 0 に
+          # 置けないため、行ごとに追記する。
+          readme="dist/$out/README.txt"
+          : > "$readme"
+          echo "tbx (silentbox)" >> "$readme"
+          echo "" >> "$readme"
+          echo "このアーカイブには tbx のバイナリとドキュメントが入っています。" >> "$readme"
+          echo "" >> "$readme"
+          echo "Windows:" >> "$readme"
+          echo "  WinFsp のバックエンドを使うには WinFsp のランタイムが必要です。" >> "$readme"
+          echo "  https://winfsp.dev/ から導入すると、ドライブとしてマウントできます。" >> "$readme"
+          echo "  WinFsp が無い場合も WebDAV モードで動きます。" >> "$readme"
+          echo "" >> "$readme"
+          echo "Linux:" >> "$readme"
+          echo "  FUSE のバックエンドを使うには /dev/fuse が必要です。" >> "$readme"
+          echo "  資格情報ストア（Secret Service）を使わない場合は tbx login --store file を指定してください。" >> "$readme"
+          echo "  musl ビルドは資格情報ストアを含みません。" >> "$readme"
+
+      - name: 起動確認（Linux）
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          bin="target/${{ matrix.target }}/release/tbx"
+          if [ "${{ matrix.target }}" = "x86_64-unknown-linux-musl" ]; then
+            docker run --rm -v "$PWD/target/${{ matrix.target }}/release:/app" \
+              --platform linux/amd64 alpine:3.20 /app/tbx --version
+          else
+            "$bin" --version
+            "$bin" --help > /dev/null
+          fi
+
+      - name: 起動確認（Windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $bin = "target\${{ matrix.target }}\release\tbx.exe"
+          if (-not (Test-Path $bin)) { throw "成果物がありません: $bin" }
+          & $bin --version
+          if ($LASTEXITCODE -ne 0) { throw "--version が $LASTEXITCODE で終了しました" }
+
+      - name: 圧縮
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.check-version.outputs.version }}"
+          target="${{ matrix.target }}"
+          out="tbx-$version-$target"
+          if [ "${{ matrix.ext }}" = "zip" ]; then
+            (cd dist && 7z a "../$out.zip" "$out")
+          else
+            tar -C dist -czf "$out.tar.gz" "$out"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tbx-${{ needs.check-version.outputs.version }}-${{ matrix.target }}
+          path: |
+            tbx-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.zip
+            tbx-${{ needs.check-version.outputs.version }}-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: [check-version, build]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: 中身を確認（空の Release を出さない）
+        run: |
+          set -euo pipefail
+          count=$(find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) | wc -l)
+          echo "成果物 $count 件"
+          find artifacts -type f | sort
+          if [ "$count" -lt 4 ]; then
+            echo "期待する 4 件に足りません" >&2
+            exit 1
+          fi
+      - uses: softprops/action-gh-release@v2
+        with:
+          # タイトルはバージョン番号のみ（規律）。
+          name: ${{ github.ref_name }}
+          tag_name: ${{ github.ref_name }}
+          files: |
+            artifacts/**/*.zip
+            artifacts/**/*.tar.gz
+          generate_release_notes: false
+          body: |
+            タグ ${{ github.ref_name }} のビルドです。
+            各アーカイブにバイナリとドキュメント（README / CHANGELOG / docs）が入っています。
+
+            Windows の WinFsp バックエンドを使うには WinFsp のランタイムが必要です
+            （LGPL/GPL の都合で DLL は同梱していません）。WinFsp が無い環境では
+            WebDAV モードで動きます。

@@ -146,6 +146,28 @@ pub fn parent_path(path: &str) -> String {
     }
 }
 
+/// `root` 配下の `path` を、`root` からの相対パス成分に分解する。
+///
+/// フォルダ一括取得で、リモートの階層をローカルへ再現するために使う。
+/// `root` が `path` の祖先でなければ `None`（別の枝を誤って展開しない）。
+pub fn relative_under(root: &str, path: &str) -> Option<Vec<String>> {
+    let root = normalize_path(root);
+    let path = normalize_path(path);
+    if root == path {
+        return Some(Vec::new());
+    }
+    let prefix = if root == "/" {
+        "/".to_string()
+    } else {
+        format!("{root}/")
+    };
+    let rest = path.strip_prefix(&prefix)?;
+    if rest.is_empty() {
+        return Some(Vec::new());
+    }
+    Some(rest.split('/').map(|s| s.to_string()).collect())
+}
+
 /// 末尾の名前を返す。ルートは空文字。
 pub fn base_name(path: &str) -> String {
     let p = normalize_path(path);
@@ -169,6 +191,20 @@ mod tests {
         assert_eq!(normalize_path("/"), "/");
         assert_eq!(normalize_path(""), "/");
         assert_eq!(normalize_path("\\\\a\\b"), "/a/b");
+    }
+
+    #[test]
+    fn relative_under_only_matches_descendants() {
+        assert_eq!(
+            relative_under("/a", "/a/b/c"),
+            Some(vec!["b".to_string(), "c".to_string()])
+        );
+        assert_eq!(relative_under("/", "/x"), Some(vec!["x".to_string()]));
+        assert_eq!(relative_under("/a", "/a"), Some(Vec::new()));
+        // 兄弟や別の枝は展開しない。
+        assert_eq!(relative_under("/a", "/ab"), None);
+        assert_eq!(relative_under("/a", "/b/c"), None);
+        assert_eq!(relative_under("/a/b", "/a"), None);
     }
 
     #[test]
