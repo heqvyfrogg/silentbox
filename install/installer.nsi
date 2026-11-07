@@ -41,7 +41,13 @@ InstallDirRegKey HKCU "${APP_KEY}" "InstallDir"
 RequestExecutionLevel user
 SetCompressor /SOLID lzma
 
-VIProductVersion "${VERSION}.0"
+; VIProductVersion は X.X.X.X の 4 桁数値しか受けず、`0.0.0-ci.0` のような
+; 接尾辞付きは `invalid VIProductVersion format` で失敗する（CI 実測）。
+; 表示用の VERSION とは別に、数値 4 桁の VERSION4 を受けられるようにする。
+!ifndef VERSION4
+  !define VERSION4 "${VERSION}.0"
+!endif
+VIProductVersion "${VERSION4}"
 VIAddVersionKey "ProductName" "${APP_DISPLAY}"
 VIAddVersionKey "CompanyName" "${APP_PUBLISHER}"
 VIAddVersionKey "FileDescription" "TeraBox の非公式クライアント"

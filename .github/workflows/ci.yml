@@ -65,7 +65,8 @@ jobs:
           Push-Location install
           $mk = "C:\Program Files (x86)\NSIS\makensis.exe"
           if (-not (Test-Path $mk)) { $mk = "C:\Program Files\NSIS\makensis.exe" }
-          & $mk /DVERSION=0.0.0-ci /DEXE=..\installer-input\tbx.exe installer.nsi
+          # VIProductVersion は 4 桁数値のみ。表示名は 0.0.0-ci、版情報は 0.0.0.0。
+          & $mk /DVERSION=0.0.0-ci /DVERSION4=0.0.0.0 /DEXE=..\installer-input\tbx.exe installer.nsi
           Pop-Location
           if (-not (Test-Path "tbx-0.0.0-ci-setup.exe")) { throw "インストーラができていません" }
           # 文字化けの再発防止: 生成物に UTF-8 の日本語がそのまま入っているか、
