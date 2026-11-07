@@ -149,6 +149,10 @@ Section "Uninstall"
   DeleteRegKey HKCU "${APP_KEY}"
 
   ; 利用者のデータは勝手に消さない。確認してから消す。
+  ; ただし無音（/S）では確認を出さない。出したままだと操作者がいない現場で
+  ; 止まり、アンインストーラが完了しない（実測: /S で MessageBox が待ち続けた）。
+  ; 無音時の既定は「データを残す」（安全側）。
+  IfSilent keep_data
   MessageBox MB_YESNO|MB_ICONQUESTION \
     "設定・キャッシュ・保存済みパスワードも削除しますか？$\r$\n$\r$\n「いいえ」を選ぶと残ります（再インストール時に引き継がれます）。$\r$\n保存済みの暗号化パスワードを消すと、暗号化したファイルは復号できなくなります。" \
     IDNO keep_data
