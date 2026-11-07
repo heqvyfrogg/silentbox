@@ -260,6 +260,9 @@ enum CryptAction {
     Disable {
         #[arg(long)]
         yes: bool,
+        /// 保存済みのパスワードも削除する（以後この鍵では復号できなくなる）。
+        #[arg(long)]
+        purge: bool,
     },
 }
 
@@ -1551,26 +1554,123 @@ fn mode_label(mode: MountMode) -> &'static str {
 // ---- 暗号化（rclone crypt 互換）。既定は無効 ----
 
 /// 暗号化のパスワードを資格情報ストアから読む。
+// ---- 暗号化のパスワード保管 ----
+//
+// 資格情報ストア（keyring）は musl ビルドで使えない（D-Bus が無い）。musl でも
+// 暗号化を使える必要があるため、keyring が無いビルドでは `secrets/crypt-<key>.json`
+// へ 0600 で保存する。保存先の種類は `secret.rs` の判定と同じ条件にする。
+
+/// このビルドが資格情報ストアを持ち、暗号化のパスワードを OS の金庫へ置けるか。
+#[cfg(all(
+    feature = "crypt",
+    any(target_os = "windows", target_os = "macos", target_env = "gnu")
+))]
+const CRYPT_USE_KEYRING: bool = true;
+#[cfg(all(
+    feature = "crypt",
+    not(any(target_os = "windows", target_os = "macos", target_env = "gnu"))
+))]
+const CRYPT_USE_KEYRING: bool = false;
+
+#[cfg(all(
+    feature = "crypt",
+    any(target_os = "windows", target_os = "macos", target_env = "gnu")
+))]
+fn crypt_password_entry(secret_key: &str) -> Result<keyring::Entry> {
+    keyring::Entry::new("tbx.terabox", &format!("crypt:{secret_key}"))
+        .map_err(|e| anyhow!("資格情報ストアを開けません: {e}"))
+}
+
+/// ファイル退避のパス（`secrets/crypt-<key>.json`）。
+#[cfg(feature = "crypt")]
+fn crypt_password_file(secret_key: &str) -> std::path::PathBuf {
+    secret::secret_dir(&terabox_core::config::tbx_home())
+        .join(format!("crypt-{secret_key}.json"))
+}
+
 #[cfg(feature = "crypt")]
 fn load_crypt_password(secret_key: &str) -> Result<String> {
-    let entry = keyring::Entry::new("tbx.terabox", &format!("crypt:{secret_key}"))
-        .map_err(|e| anyhow!("資格情報ストアを開けません: {e}"))?;
-    match entry.get_password() {
-        Ok(v) => Ok(v),
-        Err(keyring::Error::NoEntry) => bail!(
-            "暗号化のパスワードが保存されていません。`tbx crypt setup` を実行してください。"
-        ),
-        Err(e) => bail!("暗号化のパスワードを読めません: {e}"),
+    if CRYPT_USE_KEYRING {
+        #[cfg(any(target_os = "windows", target_os = "macos", target_env = "gnu"))]
+        {
+            let entry = crypt_password_entry(secret_key)?;
+            return match entry.get_password() {
+                Ok(v) => Ok(v),
+                Err(keyring::Error::NoEntry) => bail!(
+                    "暗号化のパスワードが保存されていません。`tbx crypt setup` を実行してください。"
+                ),
+                Err(e) => bail!("暗号化のパスワードを読めません: {e}"),
+            };
+        }
     }
+
+    let path = crypt_password_file(secret_key);
+    if !path.exists() {
+        bail!("暗号化のパスワードが保存されていません。`tbx crypt setup` を実行してください。");
+    }
+    let text = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow!("{} を読めません: {e}", path.display()))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| anyhow!("保存形式を読めません: {e}"))?;
+    value
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .ok_or_else(|| anyhow!("保存されたパスワードの形式が違います"))
 }
 
 #[cfg(feature = "crypt")]
 fn store_crypt_password(secret_key: &str, password: &str) -> Result<()> {
-    let entry = keyring::Entry::new("tbx.terabox", &format!("crypt:{secret_key}"))
-        .map_err(|e| anyhow!("資格情報ストアを開けません: {e}"))?;
-    entry
-        .set_password(password)
-        .map_err(|e| anyhow!("暗号化のパスワードを保存できません: {e}"))
+    if CRYPT_USE_KEYRING {
+        #[cfg(any(target_os = "windows", target_os = "macos", target_env = "gnu"))]
+        {
+            let entry = crypt_password_entry(secret_key)?;
+            return entry
+                .set_password(password)
+                .map_err(|e| anyhow!("暗号化のパスワードを保存できません: {e}"));
+        }
+    }
+
+    let path = crypt_password_file(secret_key);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| anyhow!("{} を作れません: {e}", parent.display()))?;
+    }
+    let payload = serde_json::json!({ "password": password });
+    std::fs::write(&path, serde_json::to_vec(&payload)?)
+        .map_err(|e| anyhow!("{} へ書けません: {e}", path.display()))?;
+    // 0600 にする（Unix）。Windows では ACL を変えない（利用者のプロファイル配下）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(())
+}
+
+/// 暗号化のパスワードを削除する（`crypt disable --purge` 用）。
+#[cfg(feature = "crypt")]
+fn delete_crypt_password(secret_key: &str) -> Result<bool> {
+    let mut removed = false;
+    if CRYPT_USE_KEYRING {
+        #[cfg(any(target_os = "windows", target_os = "macos", target_env = "gnu"))]
+        {
+            if let Ok(entry) = crypt_password_entry(secret_key) {
+                match entry.delete_credential() {
+                    Ok(()) => removed = true,
+                    Err(keyring::Error::NoEntry) => {}
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+    let path = crypt_password_file(secret_key);
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| anyhow!("{} を消せません: {e}", path.display()))?;
+        removed = true;
+    }
+    Ok(removed)
 }
 
 async fn cmd_crypt(action: CryptAction, json: bool) -> Result<()> {
@@ -1687,7 +1787,14 @@ async fn cmd_crypt(action: CryptAction, json: bool) -> Result<()> {
                     );
                 } else {
                     println!("暗号化を有効にしました（rclone crypt 互換）。");
-                    println!("パスワードは資格情報ストアにのみ保存しています。");
+                    if CRYPT_USE_KEYRING {
+                        println!("パスワードは資格情報ストアにのみ保存しています。");
+                    } else {
+                        println!(
+                            "パスワードは {} に保存しています（このビルドは資格情報ストアを含まないため、0600 のファイルです）。",
+                            crypt_password_file(&cfg.secret_key).display()
+                        );
+                    }
                     println!();
                     println!("注意:");
                     println!("  - パスワードを失うと、保存したデータは復号できません。");
@@ -1696,7 +1803,7 @@ async fn cmd_crypt(action: CryptAction, json: bool) -> Result<()> {
                 }
                 Ok(())
             }
-            CryptAction::Disable { yes } => {
+            CryptAction::Disable { yes, purge } => {
                 let mut cfg = CryptConfig::load().map_err(|e| anyhow!(e))?;
                 if !cfg.enabled {
                     println!("既に無効です。");
@@ -1709,10 +1816,21 @@ async fn cmd_crypt(action: CryptAction, json: bool) -> Result<()> {
                 }
                 cfg.enabled = false;
                 cfg.save().map_err(|e| anyhow!(e))?;
+                let purged = if purge {
+                    delete_crypt_password(&cfg.secret_key)?
+                } else {
+                    false
+                };
                 if json {
-                    println!("{}", serde_json::json!({"enabled": false}));
+                    println!(
+                        "{}",
+                        serde_json::json!({"enabled": false, "password_deleted": purged})
+                    );
                 } else {
                     println!("暗号化を無効にしました。保存済みの暗号文は残っています。");
+                    if purged {
+                        println!("保存済みのパスワードも削除しました。");
+                    }
                 }
                 Ok(())
             }
