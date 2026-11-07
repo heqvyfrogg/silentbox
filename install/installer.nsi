@@ -155,5 +155,10 @@ Section "Uninstall"
   RMDir /r "$LOCALAPPDATA\tbx"
   RMDir /r "$APPDATA\tbx"
   keep_data:
-  RMDir "$INSTDIR"
+  ; RMDir は空ディレクトリしか消せず、作業ディレクトリが $INSTDIR のままだと
+  ; 自分自身を消せない（実測: 空のディレクトリが残った）。
+  ; 利用者のデータは上の確認で消さない選択ができるので、ここでは
+  ; インストール物だけを再帰で片付ける。
+  SetOutPath $TEMP
+  RMDir /r "$INSTDIR"
 SectionEnd
