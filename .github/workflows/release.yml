@@ -47,19 +47,19 @@ jobs:
         include:
           - target: x86_64-pc-windows-msvc
             os: windows-latest
-            features: winfsp-backend
+            features: winfsp-backend,crypt
             ext: zip
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
-            features: fuse-backend
+            features: fuse-backend,crypt
             ext: tar.gz
           - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
-            features: ""
+            features: crypt
             ext: tar.gz
           - target: aarch64-unknown-linux-gnu
             os: ubuntu-24.04-arm
-            features: fuse-backend
+            features: fuse-backend,crypt
             ext: tar.gz
     runs-on: ${{ matrix.os }}
     steps:
@@ -176,6 +176,21 @@ jobs:
           # として置き、install から見た相対パスで渡す（名前も tbx.exe に揃える）。
           New-Item -ItemType Directory -Force -Path "installer-input" | Out-Null
           Copy-Item $bin "installer-input\tbx.exe" -Force
+          # WinFsp の公式インストーラを未改変のまま同梱する。ライセンス特例は
+          # 「未改変のインストーラ配布」を許すため、中身には手を付けない。
+          # 改変・破損を検出できるよう、公式の SHA-256 と照合する。
+          $msi = "install\winfsp.msi"
+          $url = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
+          $expected = "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A"
+          if (-not (Test-Path $msi)) {
+            Write-Host "WinFsp の MSI を公式から取得します"
+            Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 120
+          }
+          $actual = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($actual -ne $expected) {
+            throw "WinFsp の MSI が公式と一致しません（改変または破損）。取得したもの: $actual"
+          }
+          Write-Host "WinFsp MSI のハッシュ一致: $actual"
           Push-Location install
           # VIProductVersion は X.X.X.X の 4 桁のみ。
           & $mk.Source /DVERSION=$version /DVERSION4=$version.0 /DEXE=..\installer-input\tbx.exe installer.nsi
@@ -200,6 +215,8 @@ jobs:
           $setup = "tbx-$version-setup.exe"
           & 7z l $setup | Select-String -Pattern "tbx.exe" -Quiet
           if (-not $?) { throw "インストーラに tbx.exe が含まれていません" }
+          & 7z l $setup | Select-String -Pattern "winfsp.msi" -Quiet
+          if (-not $?) { throw "インストーラに WinFsp の MSI が含まれていません" }
 
       - name: 圧縮
         shell: bash

@@ -316,3 +316,70 @@ Debian 13（`6.12.113+deb13-amd64`）実機で `tbx mount ~/mnt --mode fuse` を
   NSIS のウィンドウ生成タイミングと噛み合わず確認できていない。無音時の
   「残す」経路だけが実測済み。
 - インストーラのデジタル署名は無い（SmartScreen の警告が出る可能性がある）。
+## 2026-11-07 実測: WinFsp が「利用可能」と表示されたのにマウントが失敗した
+
+`tbx doctor` が `[ok] WinFsp: 利用可能` を出した直後、`tbx mount T:` は
+`WinFsp を初期化できませんでした（WIN32_ERROR）` で失敗した。
+
+### 根本原因
+
+`winfsp_init`（winfsp 0.13）は次の順で DLL を探す。
+
+1. `LoadLibraryW("winfsp-x64.dll")`（名前だけの読み込み）
+2. `system` feature が有効な場合のみ、レジストリ `HKLM\SOFTWARE\WOW6432Node\WinFsp`
+   （または `HKLM\SOFTWARE\WinFsp`）の `InstallDir\bin\winfsp-x64.dll`
+
+一方 `winfsp_available()` は `%ProgramFiles(x86)%\WinFsp\bin\winfsp-x64.dll` の
+存在だけを見ていた。この環境には DLL が実在したが、`InstallDir` は未登録で、
+PATH にも exe の隣にも無かったため、判定は真・実行は失敗という食い違いになった。
+
+### 対策
+
+- `winfsp_available()` を、`winfsp_init` が実際に試す位置（exe の隣 →
+  `InstallDir\bin` → 既定のインストール先）の列挙に揃えた。
+- `preload_winfsp_dll()` で解決済みの DLL を絶対パスで読み込む。
+  `LoadLibraryW` は読み込み済みモジュールを返すので、その後の名前読み込みが
+  解決できる。実測: DLL を exe の隣に置かずに `T:` へマウントでき、
+  読み込んだパスは `C:\Program Files (x86)\WinFsp\bin\winfsp-x64.dll` だった。
+- `system` feature は使わない。有効にすると `winfsp-sys` がビルド時に
+  `winfsp/inc/winfsp.h` を要求するが、WinFsp の MSI は `inc` を含まない
+  （実測: `fatal error: 'winfsp/winfsp.h' file not found`）。ランタイムだけを
+  入れた環境でビルドできないため、DLL の探索は自前で行う。
+
+### 未検証
+
+WinFsp を導入していない環境で `preload_winfsp_dll` が確実に失敗し、
+案内メッセージが出ることは、この環境では再現できていない（既に導入済み）。
+
+## 2026-11-07 実測: 無音インストールが任意セクションを実行した
+
+`tbx-0.2.0-setup.exe /S` で入れたところ、構成画面で何も選んでいないのに
+HKCU の `Run` に自動起動が登録され、WinFsp の配布ページも開いた。
+NSIS の `Section` は既定で「選択済み」になるため、任意のつもりの項目が
+無音でも実行されていた。
+
+対策として任意セクションを `Section /o` にし、既定で未選択にした。
+`/S` でも何も起きない。実測: 0.2.1 のインストーラを `/S` で実行した後、
+`Run` キーは空で、`chrome` の新規起動も無かった。
+## 2026-11-07 実測: MSI の署名検証だけでは改変を検出できない
+
+インストーラは WinFsp の MSI を起動する前に `Get-AuthenticodeSignature` で
+署名を確かめている。この挙動を単体で実測した。
+
+| 入力 | Status | 期待 |
+|---|---|---|
+| 公式の MSI（未改変） | `Valid` | 実行する |
+| 途中の 1 バイトを書き換えた MSI | `Valid` | 止めたいが止まらない |
+| 半分に切り詰めた MSI | `NotSigned` | 止める（実際に止まる） |
+
+MSI は署名対象外の領域（チェックサムや証明書テーブルなど）を含むため、
+一部の改変では署名が有効なままになる。したがって署名検証は「明らかに
+壊れた・未署名のもの」を止める二次防御であって、改変検出の主力ではない。
+
+改変検出の主力は CI の SHA-256 照合。CI は公式リリースから MSI を取得し、
+`073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A` と
+一致することを確かめてから同梱する。配布されるインストーラに含まれる MSI は、
+この検証を通ったものに限られる。
+
+利用者側で同梱 MSI のハッシュを確認する手段は用意していない（インストーラは
+NSIS でハッシュ計算をしない）。必要なら `certutil -hashfile` で確認できる。

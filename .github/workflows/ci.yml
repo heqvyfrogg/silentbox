@@ -22,7 +22,7 @@ jobs:
       # 終了コードを確認する（WinFsp の DLL は同梱しないため、
       # --version だけを実行する）。
       - name: ビルド（WinFsp 込み）
-        run: cargo build --release -p terabox-cli --features winfsp-backend --target x86_64-pc-windows-msvc
+        run: cargo build --release -p terabox-cli --features winfsp-backend,crypt --target x86_64-pc-windows-msvc
       - name: 試験
         run: cargo test --workspace --bins --lib
       - name: バイナリを起動して確認
@@ -47,7 +47,7 @@ jobs:
         with:
           key: windows-msvc
       - name: ビルド
-        run: cargo build --release -p terabox-cli --features winfsp-backend --target x86_64-pc-windows-msvc
+        run: cargo build --release -p terabox-cli --features winfsp-backend,crypt --target x86_64-pc-windows-msvc
       - name: NSIS を用意
         shell: pwsh
         run: |
@@ -56,6 +56,22 @@ jobs:
           if (-not (Test-Path $mk)) { $mk = "C:\Program Files\NSIS\makensis.exe" }
           if (-not (Test-Path $mk)) { throw "makensis が見つかりません" }
           Write-Host "makensis: $mk"
+      - name: 同梱する WinFsp の MSI を検証
+        shell: pwsh
+        run: |
+          # 未改変の公式 MSI だけを同梱する。ライセンス特例の条件なので、
+          # ハッシュが一致しないものは配布しない。MSI はリポジトリに置かず、
+          # 公式リリースから取得して照合する（2.2 MB を履歴に残さない）。
+          $msi = "install\winfsp.msi"
+          $url = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
+          if (-not (Test-Path $msi)) {
+            Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 120
+          }
+          $expected = "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A"
+          $actual = (Get-FileHash $msi -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "WinFsp MSI のハッシュが公式と違います: $actual" }
+          Write-Host "OK: $actual"
+
       - name: インストーラをビルド
         shell: pwsh
         run: |
@@ -78,6 +94,8 @@ jobs:
         run: |
           & 7z l tbx-0.0.0-ci-setup.exe | Select-String -Pattern "tbx.exe" -Quiet
           if (-not $?) { throw "tbx.exe が入っていません" }
+          & 7z l tbx-0.0.0-ci-setup.exe | Select-String -Pattern "winfsp.msi" -Quiet
+          if (-not $?) { throw "winfsp.msi が入っていません" }
       - name: 文字化けの再現チェック（BOM 必須）
         shell: bash
         run: |
@@ -101,7 +119,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libdbus-1-dev pkg-config
       - name: ビルド（FUSE 込み）
-        run: cargo build --release -p terabox-cli --features fuse-backend
+        run: cargo build --release -p terabox-cli --features fuse-backend,crypt
       - name: 試験（FUSE 込み）
         # fuse-backend は terabox-cli の feature。ワークスペース全体の試験では
         # terabox-cli を明示して feature を有効にする。

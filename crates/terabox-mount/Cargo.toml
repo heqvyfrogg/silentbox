@@ -24,6 +24,12 @@ http-body-util = "0.1"
 urlencoding.workspace = true
 
 [target.'cfg(windows)'.dependencies]
+# WinFsp の DLL を絶対パスで先に読み込む（遅延ロードの解決順を確定させる）。
+libloading = "0.8"
+# `system` feature は使わない。有効にすると winfsp-sys がビルド時に
+# `winfsp/inc/winfsp.h` を要求し、ランタイムだけを入れた環境では
+# ビルドできない（実測: MSI は inc を含まない）。DLL の場所は自前で
+# 解決し、絶対パスで先に読み込む（`preload_winfsp_dll`）。
 winfsp = { version = "0.13", optional = true }
 
 [target.'cfg(unix)'.dependencies]

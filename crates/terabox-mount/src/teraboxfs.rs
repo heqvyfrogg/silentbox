@@ -491,9 +491,23 @@ mod imp {
             p.post_cleanup_when_modified_only(true);
         }
 
+        // `winfsp_init` は `LoadLibraryW("winfsp-x64.dll")` を名前で呼ぶ。PATH に
+        // 無い環境では失敗するので、先に絶対パスで読み込んで解決させる。
+        let loaded = crate::preload_winfsp_dll();
+        if std::env::var_os("TBX_WINFSP_TRACE").is_some() {
+            match &loaded {
+                Some(p) => eprintln!("[winfsp] 読み込んだ DLL: {}", p.display()),
+                None => eprintln!("[winfsp] DLL を絶対パスで読み込めませんでした（名前解決を試します）"),
+            }
+        }
         let init: FspInit = winfsp::winfsp_init().map_err(|e| {
+            let hint = if loaded.is_none() {
+                "。`winfsp-x64.dll` を exe の隣に置くか、WinFsp を導入してください"
+            } else {
+                ""
+            };
             anyhow::anyhow!(
-                "WinFsp を初期化できませんでした（winfsp-x64.dll が見つからない可能性があります）: {e}"
+                "WinFsp を初期化できませんでした（winfsp-x64.dll が見つからないか、ドライバが未導入です）{hint}: {e}"
             )
         })?;
 

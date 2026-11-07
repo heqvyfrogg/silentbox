@@ -48,7 +48,7 @@ cargo +stable-x86_64-pc-windows-msvc build --release -p terabox-cli \
 cargo build --release -p terabox-cli --features fuse-backend
 ```
 
-`winfsp-x64.dll` を exe と同じ場所へ置くか、WinFsp の `bin` を PATH に足す。
+`winfsp-x64.dll` は exe の隣、または WinFsp の `InstallDir\bin` から読み込む。
 無いと起動時に 1285 で終了する。
 
 musl で静的ビルドする場合は資格情報ストアを積まない（D-Bus の静的リンクが
@@ -166,7 +166,9 @@ tbx autostart disable
 ## インストール
 
 - Windows: Release の `tbx-<version>-setup.exe`。管理者権限は不要で
-  `%LOCALAPPDATA%\silentbox` に入る。WinFsp は同梱していない（入手先を開くだけ）。
+  `%LOCALAPPDATA%\silentbox` に入る。構成画面で「WinFsp も入れる」を選ぶと、
+  同梱された WinFsp の公式インストーラ（未改変）を起動する。選ばなければ
+  何も入れない（`tbx mount --mode webdav` で使える）。
 - Linux: Release の `tar.gz` に `install.sh` が入っている。
   `PREFIX`（既定 `~/.local`）へ置く。
 
@@ -185,7 +187,7 @@ tbx mount ~/tbx                # auto: FUSE が使えれば FUSE、無ければ 
 ```
 
 `--mode winfsp` は MSVC ターゲットでビルドした `tbx` が必要。
-`winfsp-x64.dll` を exe の隣に置くか、WinFsp の `bin` を PATH に足す。
+`winfsp-x64.dll` は exe の隣、または WinFsp の `InstallDir\bin` から読み込む。
 
 `--mode fuse` は `fusermount3` と `/dev/fuse` が必要（実測: 無いと
 `No such file or directory` で失敗する）。Unix の WebDAV モードは
@@ -208,8 +210,10 @@ Windows の WinFsp、Linux の FUSE とも、一覧・読み出し・書き込�
 | `x86_64-unknown-linux-musl` | `ubuntu-latest` |
 | `aarch64-unknown-linux-gnu`（FUSE 込み） | `ubuntu-24.04-arm` |
 
-タグと `Cargo.toml` の版が一致しないと失敗する。WinFsp の DLL は
-ライセンスの都合で同梱しない（利用者が WinFsp を導入する）。
+タグと `Cargo.toml` の版が一致しないと失敗する。WinFsp は公式の
+インストーラ（MSI）を**未改変のまま**インストーラに同梱する。構成画面で
+選んだ人だけが導入する。ライセンスと同梱物の詳細は
+`docs/THIRD-PARTY-NOTICES.md` を参照。
 
 ## テスト
 
@@ -228,3 +232,12 @@ cargo test -p terabox-core --test live_anonymous -- --ignored --nocapture
 - API は非公開で予告なく変わる。`docs/limitations.md` に未確定事項をまとめてある。
 - WebDAV は `127.0.0.1` のみで待ち受ける。外部へ公開しない。
 - 無料枠は恒久 30GiB と期間限定 994GiB の合計で、期限がある（実測）。
+
+## 第三者ソフトウェア
+
+Windows の配置には WinFsp の公式インストーラを同梱しています。
+
+- WinFsp - Windows File System Proxy, Copyright (C) Bill Zissimopoulos
+- https://github.com/winfsp/winfsp
+
+同梱物・ライセンス条件・ハッシュは `docs/THIRD-PARTY-NOTICES.md` に記載しています。

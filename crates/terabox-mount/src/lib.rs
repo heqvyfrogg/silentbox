@@ -35,26 +35,111 @@ use std::sync::Arc;
 
 use terabox_core::Session;
 
-/// WinFsp ランタイムが導入されているか。
+/// WinFsp ランタイムを読み込めるか。
 ///
-/// 既定のインストール先 `%ProgramFiles(x86)%\WinFsp\bin\winfsp-x64.dll` を見る。
+/// `winfsp_init` は「exe の隣の `winfsp-x64.dll`」→「レジストリ
+/// `HKLM\SOFTWARE\WOW6432Node\WinFsp`（または `HKLM\SOFTWARE\WinFsp`）の
+/// `InstallDir\bin\winfsp-x64.dll`」の順に探し、どちらも失敗すると初期化
+/// できない。以前は `%ProgramFiles(x86)%` の固定パスだけを見ていたため、
+/// DLL があっても `InstallDir` が未登録の環境で「利用可能」と誤報告し、
+/// 実際のマウントは失敗した（実測）。
 pub fn winfsp_available() -> bool {
     #[cfg(windows)]
     {
-        use std::path::PathBuf;
-        let mut candidates: Vec<PathBuf> = Vec::new();
-        if let Ok(pf) = std::env::var("ProgramFiles(x86)") {
-            candidates.push(PathBuf::from(pf).join(r"WinFsp\bin\winfsp-x64.dll"));
-        }
-        if let Ok(pf) = std::env::var("ProgramFiles") {
-            candidates.push(PathBuf::from(pf).join(r"WinFsp\bin\winfsp-x64.dll"));
-        }
-        candidates.iter().any(|p| p.exists())
+        winfsp_dll_candidates().iter().any(|p| p.exists())
     }
     #[cfg(not(windows))]
     {
         false
     }
+}
+
+/// `winfsp_init` が実際に試す DLL の位置を列挙する。
+#[cfg(windows)]
+pub fn winfsp_dll_candidates() -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // 1) exe の隣（`load_local_winfsp` が最初に試す場所）。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("winfsp-x64.dll"));
+        }
+    }
+
+    // 2) レジストリの InstallDir（`get_system_winfsp` が読む場所）。
+    //    32-bit インストーラは WOW6432Node 側、ARM64 は直下に書く。
+    for subkey in [
+        r"SOFTWARE\WOW6432Node\WinFsp",
+        r"SOFTWARE\WinFsp",
+    ] {
+        if let Some(dir) = read_install_dir(subkey) {
+            candidates.push(PathBuf::from(dir).join("bin").join("winfsp-x64.dll"));
+        }
+    }
+
+    // 3) 既定のインストール先（InstallDir が未登録でも実体がある場合の保険）。
+    for var in ["ProgramFiles(x86)", "ProgramFiles"] {
+        if let Ok(pf) = std::env::var(var) {
+            candidates.push(PathBuf::from(pf).join(r"WinFsp\bin\winfsp-x64.dll"));
+        }
+    }
+
+    candidates
+}
+
+/// 解決済みの DLL を絶対パスで読み込む。
+///
+/// `winfsp_init` は内部で `LoadLibraryW("winfsp-x64.dll")` を呼ぶ。これは
+/// 名前だけの読み込みなので、PATH やアプリのディレクトリに無いと失敗する。
+/// 先に絶対パスで読み込んでおくと、その後の名前読み込みは読み込み済みの
+/// モジュールを返すため、遅延ロードが解決できる。
+///
+/// 戻り値は「読み込めた DLL のパス」。プロセス終了までハンドルを保持する。
+#[cfg(all(windows, feature = "winfsp-backend"))]
+pub fn preload_winfsp_dll() -> Option<std::path::PathBuf> {
+    use std::sync::OnceLock;
+
+    static LOADED: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    LOADED
+        .get_or_init(|| {
+            for candidate in winfsp_dll_candidates() {
+                if !candidate.exists() {
+                    continue;
+                }
+                // ライブラリはプロセス終了まで保持する（`Library` を落とすと
+                // 読み込みが解除され、遅延ロードがまた失敗する）。
+                match unsafe { libloading::Library::new(&candidate) } {
+                    Ok(lib) => {
+                        std::mem::forget(lib);
+                        return Some(candidate);
+                    }
+                    Err(_) => continue,
+                }
+            }
+            None
+        })
+        .clone()
+}
+
+/// `HKLM` の WinFsp サブキーから `InstallDir` を読む。無ければ `None`。
+#[cfg(windows)]
+fn read_install_dir(subkey: &str) -> Option<String> {
+    let output = std::process::Command::new("reg")
+        .args(["query", &format!(r"HKLM\{subkey}"), "/v", "InstallDir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // 出力例: "    InstallDir    REG_SZ    C:\Program Files (x86)\WinFsp"
+    text.lines()
+        .find(|l| l.contains("InstallDir"))
+        .and_then(|l| l.split("REG_SZ").nth(1))
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// FUSE が使えるか。ビルドに含まれていて、`/dev/fuse` が開けることを確かめる。
