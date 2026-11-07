@@ -7,7 +7,12 @@
 ;   - パスは固定文字列で埋め込まず、$INSTDIR からの相対で扱う。
 ;
 ; ビルド:
-;   makensis /DVERSION=0.2.0 /DEXE=path\to\tbx.exe install\installer.nsi
+;   cd install
+;   makensis /DVERSION=0.2.0 /DEXE=..\tbx-installer-input.exe installer.nsi
+;
+; `/D` の値は引用符なしの 1 トークンとして解釈されるため、空白を含む絶対
+; パスは渡せない（実測）。リポジトリ直下に exe を置き、install から見た
+; 相対パスで渡す。
 ;
 ; GitHub の Windows ランナーには NSIS 3.10 が入っている（実測）。
 

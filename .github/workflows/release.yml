@@ -151,12 +151,32 @@ jobs:
         run: |
           $version = "${{ needs.check-version.outputs.version }}"
           $bin = (Resolve-Path "target\${{ matrix.target }}\release\tbx.exe").Path
-          $env:PATH = "$env:PATH;C:\Program Files (x86)\NSIS"
-          if (-not (Get-Command makensis -ErrorAction SilentlyContinue)) {
-            throw "makensis が見つかりません（NSIS がランナーに無い可能性）"
+
+          # ランナー同梱の NSIS はパスが一定でない（実測: 記載の 3.10 が
+          # `C:\Program Files (x86)\NSIS` に見つからず失敗した）。
+          # Chocolatey で入れて場所を確実にする。
+          $mk = Get-Command makensis -ErrorAction SilentlyContinue
+          if (-not $mk) {
+            Write-Host "NSIS を導入します"
+            choco install nsis --yes --no-progress
+            $candidates = @(
+              "C:\Program Files (x86)\NSIS\makensis.exe",
+              "C:\Program Files\NSIS\makensis.exe"
+            )
+            foreach ($c in $candidates) {
+              if (Test-Path $c) { $mk = @{ Source = $c }; break }
+            }
           }
+          if (-not $mk) { throw "makensis を導入できませんでした" }
+          $env:PATH = "$env:PATH;" + (Split-Path $mk.Source)
+          Write-Host "makensis: $($mk.Source)"
+          & $mk.Source /VERSION | Select-Object -First 1
+          # NSIS は `/D` の値を引用符なしの 1 トークンとして食べるため、
+          # 空白を含む絶対パスは渡せない。リポジトリ直下へ exe をコピーし、
+          # 相対パスで渡す。
+          Copy-Item $bin "tbx-installer-input.exe" -Force
           Push-Location install
-          makensis /DVERSION=$version /DEXE="$bin" installer.nsi
+          & $mk.Source /DVERSION=$version /DEXE=..\tbx-installer-input.exe installer.nsi
           $code = $LASTEXITCODE
           Pop-Location
           if ($code -ne 0) { throw "makensis が $code で終了しました" }
