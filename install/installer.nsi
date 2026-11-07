@@ -1,4 +1,4 @@
-; tbx（silentbox）Windows インストーラ
+﻿; tbx（silentbox）Windows インストーラ
 ;
 ; 設計方針:
 ;   - 管理者権限を要求しない（ユーザー単位で完結する）。WinFsp は別途入れる。

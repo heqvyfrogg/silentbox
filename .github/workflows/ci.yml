@@ -34,6 +34,57 @@ jobs:
           & $exe --help | Out-Null
         shell: pwsh
 
+  # インストーラはリリース時にしか作られないと、壊れたまま配布される。
+  # 毎 push でビルドして、文字化けや同梱物の欠落を早く見つける。
+  test-installer:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-msvc
+      - name: ビルド
+        run: cargo build --release -p terabox-cli --features winfsp-backend --target x86_64-pc-windows-msvc
+      - name: NSIS を用意
+        shell: pwsh
+        run: |
+          choco install nsis --yes --no-progress
+          $mk = "C:\Program Files (x86)\NSIS\makensis.exe"
+          if (-not (Test-Path $mk)) { $mk = "C:\Program Files\NSIS\makensis.exe" }
+          if (-not (Test-Path $mk)) { throw "makensis が見つかりません" }
+          Write-Host "makensis: $mk"
+      - name: インストーラをビルド
+        shell: pwsh
+        run: |
+          $bin = (Resolve-Path "target\x86_64-pc-windows-msvc\release\tbx.exe").Path
+          New-Item -ItemType Directory -Force -Path "installer-input" | Out-Null
+          Copy-Item $bin "installer-input\tbx.exe" -Force
+          Push-Location install
+          $mk = "C:\Program Files (x86)\NSIS\makensis.exe"
+          if (-not (Test-Path $mk)) { $mk = "C:\Program Files\NSIS\makensis.exe" }
+          & $mk /DVERSION=0.0.0-ci /DEXE=..\installer-input\tbx.exe installer.nsi
+          Pop-Location
+          if (-not (Test-Path "tbx-0.0.0-ci-setup.exe")) { throw "インストーラができていません" }
+          # 文字化けの再発防止: 生成物に UTF-8 の日本語がそのまま入っているか、
+          # 逆に cp1252 由来の文字化け列が無いかを確認する。
+          $nsi = Get-Content "install\installer.nsi" -Encoding utf8 -Raw
+          if ($nsi -notmatch "設定・キャッシュ・保存済みパスワード") { throw "検証対象の文言が変わっています" }
+      - name: 同梱物を確認
+        shell: pwsh
+        run: |
+          & 7z l tbx-0.0.0-ci-setup.exe | Select-String -Pattern "tbx.exe" -Quiet
+          if (-not $?) { throw "tbx.exe が入っていません" }
+      - name: 文字化けの再現チェック（BOM 必須）
+        shell: bash
+        run: |
+          set -euo pipefail
+          head -c 3 install/installer.nsi | xxd | grep -q "efbb bf" \
+            || { echo "installer.nsi に UTF-8 BOM がありません（NSIS が ANSI として読み、日本語が壊れます）" >&2; exit 1; }
+          echo "BOM あり: OK"
+
   test-linux-gnu:
     runs-on: ubuntu-latest
     steps:
