@@ -172,11 +172,12 @@ jobs:
           Write-Host "makensis: $($mk.Source)"
           & $mk.Source /VERSION | Select-Object -First 1
           # NSIS は `/D` の値を引用符なしの 1 トークンとして食べるため、
-          # 空白を含む絶対パスは渡せない。リポジトリ直下へ exe をコピーし、
-          # 相対パスで渡す。
-          Copy-Item $bin "tbx-installer-input.exe" -Force
+          # 空白を含む絶対パスは渡せない。リポジトリ直下へ `installer-input\tbx.exe`
+          # として置き、install から見た相対パスで渡す（名前も tbx.exe に揃える）。
+          New-Item -ItemType Directory -Force -Path "installer-input" | Out-Null
+          Copy-Item $bin "installer-input\tbx.exe" -Force
           Push-Location install
-          & $mk.Source /DVERSION=$version /DEXE=..\tbx-installer-input.exe installer.nsi
+          & $mk.Source /DVERSION=$version /DEXE=..\installer-input\tbx.exe installer.nsi
           $code = $LASTEXITCODE
           Pop-Location
           if ($code -ne 0) { throw "makensis が $code で終了しました" }

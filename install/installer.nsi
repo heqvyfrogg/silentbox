@@ -67,7 +67,11 @@ VIAddVersionKey "FileVersion" "${VERSION}"
 Section "本体（必須）" SEC_CORE
   SectionIn RO
   SetOutPath "$INSTDIR"
-  File "${EXE}"
+  ; NSIS の File はソースのベース名をそのまま使う。入力の exe 名を
+  ; tbx.exe に固定するため /oname を付ける（付け忘れると
+  ; tbx-installer-input.exe のまま入り、アンインストーラの削除対象とも
+  ; 食い違う。実測で確認）。
+  File /oname=${APP_EXE} "${EXE}"
   File /oname=README.md "..\README.md"
   File /oname=CHANGELOG.md "..\CHANGELOG.md"
   SetOutPath "$INSTDIR\docs"
@@ -110,7 +114,7 @@ Section "PC 起動時に自動でマウント（任意）" SEC_AUTOSTART
   ; ドライブレターは環境設定から読む（未設定なら T:）。
   WriteRegStr HKCU "${APP_KEY}" "AutoStart" "1"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "silentbox" \
-    '"$INSTDIR\tbx.exe" mount T:'
+    '"$INSTDIR\${APP_EXE}" mount T:'
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
@@ -126,7 +130,8 @@ Section "Uninstall"
   ; 自動起動の登録を外す。
   DeleteRegValue HKCU "Software\Microsoft\Windows\CurrentVersion\Run" "silentbox"
 
-  Delete "$INSTDIR\tbx.exe"
+  ; 名前は `APP_EXE` と一致させる（片方だけ直すと消し忘れる）。
+  Delete "$INSTDIR\${APP_EXE}"
   Delete "$INSTDIR\README.md"
   Delete "$INSTDIR\CHANGELOG.md"
   Delete "$INSTDIR\docs\limitations.md"
