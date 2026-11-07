@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 description = "tbx: unofficial TeraBox command-line client"
 
+build = "build.rs"
+
 [[bin]]
 name = "tbx"
 path = "src/main.rs"

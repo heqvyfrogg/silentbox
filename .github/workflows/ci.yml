@@ -71,6 +71,13 @@ jobs:
           key: linux-musl
       # musl は D-Bus の静的リンクが現実的でないため、資格情報ストアを積まない。
       # `--store file` を明示して使う（README に記載）。
+      #
+      # `ring` は C コードを含むため musl 用のクロス gcc が要る。実測:
+      # 無いと `failed to find tool "x86_64-linux-musl-gcc"` で止まる。
+      - name: musl のクロスコンパイラ
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
       - name: ビルド
         run: cargo build --release -p terabox-cli --target x86_64-unknown-linux-musl
       - name: alpine で起動確認（ビルドが通るだけでは足りない）
