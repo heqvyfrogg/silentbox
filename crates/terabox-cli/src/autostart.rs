@@ -153,7 +153,7 @@ fn unit_text(exe: &std::path::Path, target: &str, crypt: bool) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart=\"{}\" mount {} --mode fuse{crypt}\n\
+         ExecStart=\"{}\" mount {} --mode fuse{}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
