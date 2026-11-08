@@ -407,3 +407,54 @@ WinFsp のホストが `Arc<dyn RemoteFs>` を受けるようにしたことで�
   誤認した。実際はゴミ箱へ入る前の状態を見ていた。`tbx rm` で移してから
   `trash clear` すると `ls` から消え、`get` は
   `31066 file does not exist` を返した（実体が消えた証拠）。
+## 2026-11-08 実測: インストーラが PATH を壊す（Issue #1）
+
+Issue #1 の指摘は正しかった。ただし修正案（`ReadRegStr` + `WriteRegExpandStr`）
+も、まさに壊れる条件では動かない。実測で両方を確かめた。
+
+### 症状の再現
+
+| 手段 | 入力 | 結果 |
+|---|---|---|
+| `setx PATH`（Issue の指摘） | 1100 文字 | 1024 文字で保存。終了コード 0、警告は stderr のみ |
+| `setx PATH`（実際の PATH） | 2593 文字 / 69 エントリ | 1024 文字 / 32 エントリ。末尾が `C:\` で切れた |
+| NSIS `ReadRegStr`（Issue の修正案） | 1023 文字 | 正しく読めた（len=1023） |
+| NSIS `ReadRegStr`（Issue の修正案） | 1024 文字 | 例外も警告もなく空文字列（len=0） |
+| NSIS `ReadRegStr`（Issue の修正案） | 1100 文字 | 同上（len=0） |
+| NSIS `ReadRegStr` + `/DNSIS_MAX_STRLEN=8192` | 1100 文字 | 変わらず len=0 |
+
+つまり Issue の修正案をそのまま適用すると、長い PATH を持つ環境で既存値を
+「空」と誤認し、PATH 全体を `$INSTDIR` だけで上書きする。実際にこの調査中に
+2593 文字 -> 37 文字まで壊した（退避から復旧した）。
+
+### 採った修正
+
+PATH の加減算を `install/update-path.ps1` へ委譲する。.NET の
+`Microsoft.Win32.Registry` を直接使い、長さ制限を受けずに読み書きする。
+`DoNotExpandEnvironmentNames` で読み、値の種類（REG_SZ / REG_EXPAND_SZ）を
+そのまま書き戻す（`%VAR%` を実パスに化けさせない）。
+
+NSIS 側は環境変数で action とディレクトリを渡し、`nsExec::ExecToStack` で
+終了コードと標準出力の 1 行目（`ADDED` / `ALREADY` / `REMOVED` / `NOTFOUND`）
+を受け取る。
+
+### 実測結果
+
+| 手順 | PATH | エントリ数 |
+|---|---|---|
+| 開始（2593 文字） | 2593 | 69 |
+| インストール | 2631 | 70（既存 69 件すべて残存、失われた 0） |
+| 再インストール | 2631 | 70（`ALREADY` で重複追記なし） |
+| アンインストール | 2593 | 69（退避と完全一致） |
+
+長い PATH（4070 文字）でも同じ結果だった（4108 -> 4070 で完全一致）。
+
+### 途中で踏んだこと
+
+- 補助スクリプトを `$PLUGINSDIR` へ置く前に `InitPluginsDir` を呼ばないと、
+  実行時に「.ps1 が存在しません」で失敗する。`File` は成功したように見える。
+- `.ps1` に UTF-8 BOM が無いと、Windows PowerShell 5.1 が ANSI として読み、
+  日本語コメントで構文が壊れる（実測: `Missing ')' in method call`）。
+- アンインストール前にマウント（`tbx mount`）を止めないと、実行中の
+  `tbx.exe` がロックされ、`RMDir /r` が `tbx.exe` を消せない。これは
+  インストーラの不具合ではなく、手順の前提。

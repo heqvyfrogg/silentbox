@@ -23,6 +23,8 @@ Unicode true
 !include "MUI2.nsh"
 !include "LogicLib.nsh"
 !include "FileFunc.nsh"
+; レジストリ変更を他プロセスへ通知する定数（HWND_BROADCAST / WM_SETTINGCHANGE）。
+!include "WinMessages.nsh"
 
 !ifndef VERSION
   !define VERSION "0.0.0"
@@ -91,12 +93,49 @@ Section "本体（必須）" SEC_CORE
 
   SetOutPath "$INSTDIR"
 
-  ; パスを通す（ユーザーの PATH へ追記。既存の値は消さない）。
   WriteRegStr HKCU "${APP_KEY}" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "${APP_KEY}" "Version" "${VERSION}"
 
-  nsExec::ExecToLog 'cmd /c setx PATH "%PATH%;$INSTDIR" >nul'
-  Pop $R0
+  ; ユーザーの PATH へ $INSTDIR を追記する。
+  ;
+  ; NSIS の ReadRegStr は 1023 文字までしか読めず、1024 文字以上は例外も
+  ; 警告もなく空文字列になる（実測: 1023 -> len=1023、1024 と 1100 -> len=0。
+  ; /DNSIS_MAX_STRLEN=8192 でも変わらない）。長い PATH を持つ環境（まさに
+  ; 壊れる条件）で ReadRegStr を使うと、既存値を空と誤認して PATH 全体を
+  ; $INSTDIR だけで上書きしてしまう（実測で 2593 文字 -> 37 文字に壊した）。
+  ;
+  ; setx も使えない。setx は保存値を 1024 文字で打ち切る（終了コード 0、
+  ; 警告は stderr のみ）。
+  ;
+  ; したがって .NET のレジストリ API を使う補助スクリプトへ委譲する。
+  ; 長さ制限が無く、値の種類（REG_SZ / REG_EXPAND_SZ）も保てる。
+  ; `$PLUGINSDIR` は InitPluginsDir を呼ぶまで作られない。忘れると File は
+  ; 通ったように見えるが、実行時に「.ps1 が存在しません」で失敗する（実測）。
+  InitPluginsDir
+  File "/oname=$PLUGINSDIR\update-path.ps1" "update-path.ps1"
+
+  ; PowerShell へ渡す値は環境変数で渡す（コマンドラインの引用符問題を避ける）。
+  ; PATH の値そのものではなくディレクトリだけを渡すので、長さの心配も無い。
+  System::Call 'kernel32::SetEnvironmentVariable(t "TBX_PATH_ACTION", t "add") i .r0'
+  System::Call 'kernel32::SetEnvironmentVariable(t "TBX_INSTALL_DIR", t "$INSTDIR") i .r0'
+
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\update-path.ps1"'
+  Pop $R1   ; 終了コード
+  Pop $R0   ; 標準出力の 1 行目（ALREADY / ADDED / ...）
+  DetailPrint "PATH 更新: $R0（終了コード $R1）"
+
+  ${If} $R1 != "0"
+    ; 黙って続行しない。インストール自体は完了させるが、利用者へ明示する。
+    MessageBox MB_ICONEXCLAMATION|MB_OK \
+      "PATH を更新できませんでした（$R0）。$\r$\n$\r$\nインストールは完了していますが、コマンドとして使うには手動で次を PATH に追加してください:$\r$\n$INSTDIR"
+  ${EndIf}
+
+  ; レジストリを変えただけでは、既に起動しているプロセス（エクスプローラ等）
+  ; は新しい PATH を読み直さない。設定変更を通知する。
+  ; 補助スクリプトが成功した場合だけ通知する（失敗時に通知しても意味がない）。
+  ${If} $R0 == "ADDED"
+    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+  ${EndIf}
 
   WriteUninstaller "$INSTDIR\uninstall.exe"
 
@@ -189,6 +228,20 @@ Section "Uninstall"
 
   DeleteRegKey HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\silentbox"
   DeleteRegKey HKCU "${APP_KEY}"
+
+  ; PATH から $INSTDIR を外す。外さないと、次に起動したプロセスが存在しない
+  ; ディレクトリを PATH に持ち続ける（インストーラで追記した分を対称に戻す）。
+  ; 加減算は補助スクリプトへ任せる（NSIS の文字列 API は 1023 文字で切れる）。
+  InitPluginsDir
+  File "/oname=$PLUGINSDIR\update-path.ps1" "update-path.ps1"
+  System::Call 'kernel32::SetEnvironmentVariable(t "TBX_PATH_ACTION", t "remove") i .r0'
+  System::Call 'kernel32::SetEnvironmentVariable(t "TBX_INSTALL_DIR", t "$INSTDIR") i .r0'
+  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\update-path.ps1"'
+  Pop $R1
+  Pop $R0
+  ${If} $R0 == "REMOVED"
+    SendMessage ${HWND_BROADCAST} ${WM_SETTINGCHANGE} 0 "STR:Environment" /TIMEOUT=5000
+  ${EndIf}
 
   ; 利用者のデータは勝手に消さない。確認してから消す。
   ; ただし無音（/S）では確認を出さない。出したままだと操作者がいない現場で

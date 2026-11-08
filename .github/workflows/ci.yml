@@ -102,7 +102,80 @@ jobs:
           set -euo pipefail
           head -c 3 install/installer.nsi | xxd | grep -q "efbb bf" \
             || { echo "installer.nsi に UTF-8 BOM がありません（NSIS が ANSI として読み、日本語が壊れます）" >&2; exit 1; }
+          # 補助の PowerShell も BOM が無いと Windows PowerShell 5.1 が ANSI として
+          # 読み、日本語コメントで構文が壊れる（実測）。
+          head -c 3 install/update-path.ps1 | xxd | grep -q "efbb bf" \
+            || { echo "update-path.ps1 に UTF-8 BOM がありません" >&2; exit 1; }
           echo "BOM あり: OK"
+
+      # Issue #1 の回帰テスト。PATH が長い環境で、インストーラが既存エントリを
+      # 失わないこと、二重追記しないこと、アンインストーラが元へ戻すことを
+      # 実プロセスで確かめる。setx（1024 文字で切る）と NSIS の ReadRegStr
+      # （1024 文字以上は空になる）の両方を踏んでいるので、実測で固定する。
+      - name: PATH を壊さないことの実測（Issue #1）
+        shell: pwsh
+        run: |
+          $dir = "$env:LOCALAPPDATA\silentbox"
+          $key = [Microsoft.Win32.Registry]::CurrentUser
+
+          # 1024 文字を超える PATH を作る（壊れる条件を満たす）。
+          $long = ((1..80) | ForEach-Object { "C:\ci-path-segment-$_\a-fairly-long-directory-name" }) -join ';'
+          if ($long.Length -le 1024) { throw "テスト用 PATH が短すぎます: $($long.Length)" }
+
+          $k = $key.OpenSubKey("Environment", $true)
+          $saved = $null
+          try {
+            $saved = $k.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $k.SetValue("Path", $long, [Microsoft.Win32.RegistryValueKind]::String)
+          } finally { $k.Close() }
+
+          try {
+            $before = $long.Length
+            Write-Host "テスト用 PATH: $before 文字"
+
+            # 1) インストール。既存エントリが 1 つも失われないこと。
+            $proc = Start-Process -FilePath "tbx-0.0.0-ci-setup.exe" -ArgumentList "/S" -PassThru
+            $proc.WaitForExit(180000) | Out-Null
+            $k2 = $key.OpenSubKey("Environment", $false)
+            $after = [string]$k2.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $k2.Close()
+
+            if ($after.Length -le $before) { throw "PATH が伸びていません（$before -> $($after.Length)）" }
+            if ($after -notmatch [regex]::Escape($dir)) { throw "PATH に $dir が入っていません" }
+            $lost = (1..80) | Where-Object { $after -notmatch [regex]::Escape("ci-path-segment-$_") }
+            if ($lost) { throw "PATH から既存エントリが失われました: segment $($lost -join ',')" }
+            Write-Host "インストール後: $($after.Length) 文字（既存エントリは全て残存）"
+
+            # 2) 二重インストールで重複追記しないこと。
+            $proc = Start-Process -FilePath "tbx-0.0.0-ci-setup.exe" -ArgumentList "/S" -PassThru
+            $proc.WaitForExit(180000) | Out-Null
+            $k3 = $key.OpenSubKey("Environment", $false)
+            $again = [string]$k3.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $k3.Close()
+            if ($again.Length -ne $after.Length) {
+              throw "再インストールで PATH が変わりました（$($after.Length) -> $($again.Length)）"
+            }
+
+            # 3) アンインストールで元へ戻ること。
+            $u = Join-Path $dir "uninstall.exe"
+            if (-not (Test-Path $u)) { throw "アンインストーラがありません: $u" }
+            $proc = Start-Process -FilePath $u -ArgumentList "/S" -PassThru
+            $proc.WaitForExit(180000) | Out-Null
+            $k4 = $key.OpenSubKey("Environment", $false)
+            $restored = [string]$k4.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            $k4.Close()
+            if ($restored -ne $long) {
+              throw "アンインストール後の PATH が元と違います（$($restored.Length) 文字）"
+            }
+            Write-Host "アンインストール後: $($restored.Length) 文字（元と一致）"
+          } finally {
+            # 必ず元の PATH へ戻す（CI ランナーの後続処理を壊さない）。
+            $k5 = $key.OpenSubKey("Environment", $true)
+            try {
+              $k5.SetValue("Path", [string]$saved, [Microsoft.Win32.RegistryValueKind]::String)
+            } finally { $k5.Close() }
+            Remove-Item $dir -Recurse -Force -ErrorAction SilentlyContinue
+          }
 
   test-linux-gnu:
     runs-on: ubuntu-latest

@@ -173,7 +173,10 @@ tbx autostart disable
 - Windows: Release の `tbx-<version>-setup.exe`。管理者権限は不要で
   `%LOCALAPPDATA%\silentbox` に入る。構成画面で「WinFsp も入れる」を選ぶと、
   同梱された WinFsp の公式インストーラ（未改変）を起動する。選ばなければ
-  何も入れない（`tbx mount --mode webdav` で使える）。
+  何も入れない（`tbx mount --mode webdav` で使える）。インストーラは
+  ユーザーの PATH へ `%LOCALAPPDATA%\silentbox` を追記する。既存の PATH は
+  1 件も失わない（1024 文字を超える PATH でも実測で確認）。アンインストール
+  すると PATH からも外れる。
 - Linux: Release の `tar.gz` に `install.sh` が入っている。
   `PREFIX`（既定 `~/.local`）へ置く。
 
