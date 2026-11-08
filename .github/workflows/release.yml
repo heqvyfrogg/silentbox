@@ -180,7 +180,13 @@ jobs:
           # 「未改変のインストーラ配布」を許すため、中身には手を付けない。
           # 改変・破損を検出できるよう、公式の SHA-256 と照合する。
           $msi = "install\winfsp.msi"
-          $url = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
+          # releases/download の URL は 504 を持続的に返すことがある（実測: 5 回
+          # 連続で 504）。API の asset エンドポイント（Accept:
+          # application/octet-stream）経由なら取得できる（実測でハッシュ・署名とも一致）。
+          # まず通常 URL、駄目なら API 経由を試す。
+          $tag = "v2.1"
+          $assetName = "winfsp-2.1.25156.msi"
+          $url = "https://github.com/winfsp/winfsp/releases/download/$tag/$assetName"
           $expected = "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A"
           if (-not (Test-Path $msi)) {
             Write-Host "WinFsp の MSI を公式から取得します"
@@ -195,6 +201,22 @@ jobs:
             } catch {
               Write-Host "取得に失敗（$attempt 回目）: $_"
               if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+            }
+          }
+          if (-not $ok) {
+            # 通常の releases/download が 504 を持続的に返す場合の代替経路。
+            # API で asset の実 URL を引き、octet-stream として取得する。
+            Write-Host "release の URL で取得できないため、API 経由で取得します"
+            try {
+              $release = Invoke-RestMethod -Uri "https://api.github.com/repos/winfsp/winfsp/releases/tags/$tag" `
+                -Headers @{ "User-Agent" = "tbx-ci"; "Accept" = "application/vnd.github+json" } -TimeoutSec 60
+              $asset = $release.assets | Where-Object { $_.name -eq $assetName } | Select-Object -First 1
+              if (-not $asset) { throw "asset '$assetName' がリリース $tag にありません" }
+              Invoke-WebRequest -Uri $asset.url -OutFile $msi -TimeoutSec 180 `
+                -Headers @{ "User-Agent" = "tbx-ci"; "Accept" = "application/octet-stream" }
+              $ok = $true
+            } catch {
+              Write-Host "API 経由でも取得できません: $_"
             }
           }
           if (-not $ok) { throw "WinFsp の MSI を取得できません: $url" }

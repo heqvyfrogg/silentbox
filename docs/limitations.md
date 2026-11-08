@@ -479,3 +479,23 @@ CI では露見した。
 対策として、CI のテストは PATH が元の値へ戻るまで 0.5 秒間隔で最大 120 秒
 ポーリングする。テストのためだけの待機だが、アンインストーラの挙動を
 正しく扱うには必要。
+## 2026-11-08 実測: GitHub の releases/download が 504 を持続的に返す
+
+CI の「同梱する WinFsp の MSI を検証」が 504 Gateway Time-out で失敗した。
+再試行を入れても 3 回とも 504 だったため、一過性か持続的かを切り分けた。
+
+| 経路 | 結果 |
+|---|---|
+| `releases/download/v2.1/winfsp-2.1.25156.msi` を 5 回 | 5 回とも 504 |
+| `api.github.com/repos/winfsp/winfsp/releases/tags/v2.1` | 200（メタデータは取れる） |
+| `api.github.com/.../releases/assets/261281897` + `Accept: application/octet-stream` | 200、2,191,360 バイト |
+
+取得した MSI の SHA-256 は
+`073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A` で公式と
+一致し、Authenticode 署名も `Valid`（NAVIMATICS LLC）だった。
+
+対策として CI とリリースの取得手順に、通常 URL で失敗した場合の API 経由
+フォールバックを入れた。実測でこの経路が通ることを確認している。
+
+なお、この 504 は GitHub 側の一時的な障害であり、恒久的な仕様ではない。
+通常 URL が復旧すれば、そちらが使われる（フォールバックは発動しない）。
