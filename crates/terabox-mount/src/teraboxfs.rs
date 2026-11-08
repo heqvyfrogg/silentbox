@@ -241,7 +241,6 @@ mod imp {
         ) -> winfsp::Result<u32> {
             let entries = block_on(self.fs.read_dir(&context.path))
                 .map_err(|_| FspError::IO(ErrorKind::Other))?;
-
             let marker_raw = marker
                 .inner()
                 .map(|raw| String::from_utf16_lossy(&raw[..raw.len().saturating_sub(1)]));

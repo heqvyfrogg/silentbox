@@ -52,11 +52,30 @@ fn sanitize(input: &str) -> String {
 /// マーカーがこの名前を指しているか。
 ///
 /// フルネーム（大文字小文字を無視）と 8.3 短縮名のどちらでも一致させる。
+/// 加えて、WinFsp がバッファの都合でマーカーを切り詰めて返す場合に備え、
+/// 名前の接頭辞でも一致とみなす（実測: `a.png` のマーカーが `a.pn` で返り、
+/// 完全一致だけで比べると 2 件目以降が丸ごと欠落した）。
+///
+/// 接頭辞の一致は 3 文字以上に限る。1〜2 文字の接頭辞まで許すと `a` が
+/// `abc.txt` に一致して 1 件飛ばすため。
 pub fn marker_matches(marker: &str, name: &str) -> bool {
+    if marker.is_empty() {
+        return false;
+    }
     if marker.eq_ignore_ascii_case(name) {
         return true;
     }
-    marker.eq_ignore_ascii_case(&short_name(name))
+    if marker.eq_ignore_ascii_case(&short_name(name)) {
+        return true;
+    }
+    if marker.chars().count() < 3 {
+        return false;
+    }
+    let needle = marker.to_lowercase();
+    if name.to_lowercase().starts_with(&needle) {
+        return true;
+    }
+    short_name(name).to_lowercase().starts_with(&needle)
 }
 
 #[cfg(test)]
@@ -91,7 +110,22 @@ mod tests {
         assert!(marker_matches("tbx-probe", "tbx-probe"));
         assert!(marker_matches("TBX-PROB", "tbx-probe"));
         assert!(marker_matches("tbx-prob", "tbx-probe"));
-        assert!(!marker_matches("tbx-pro", "tbx-probe"));
+        // マーカーは名前より短いこともある（WinFsp がバッファに合わせて
+        // 切り詰める）。前方一致で拾わないと 2 件目以降が丸ごと欠落する。
+        assert!(marker_matches("tbx-pro", "tbx-probe"));
+        assert!(!marker_matches("tbx-prx", "tbx-probe"));
+        assert!(!marker_matches("zzz", "tbx-probe"));
+    }
+
+    #[test]
+    fn truncated_marker_still_matches() {
+        // 実測: 2 件目を返すときの WinFsp のマーカーは `a.pn` だった
+        // （`a.png` の切り詰め）。完全一致だけで比べると一致せず、
+        // 2 ページ目以降が空になる（実測: 2 件あるのに 1 件しか見えなかった）。
+        assert!(marker_matches("a.pn", "a.png"));
+        assert!(marker_matches("A.PN", "a.png"));
+        // 短縮名の切り詰めでも拾えること。
+        assert!(marker_matches("A.P", "a.png"));
     }
 
     #[test]
