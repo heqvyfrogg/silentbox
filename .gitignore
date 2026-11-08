@@ -22,6 +22,3 @@ Thumbs.db
 # ローカルでビルドしたインストーラ（Release では CI が作る）
 tbx-*-setup.exe
 installer-input/
-
-# WinFsp の MSI は CI が公式から取得する（リポジトリには置かない）
-install/winfsp.msi

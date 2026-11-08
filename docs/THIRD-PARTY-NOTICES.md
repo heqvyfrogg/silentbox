@@ -18,6 +18,11 @@ Windows のインストーラ `tbx-<version>-setup.exe` には、WinFsp 公式�
 
 - ファイル名: `winfsp-2.1.25156.msi`
 - SHA-256: `073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A`
+- 置き場所: このリポジトリの `install/winfsp.msi`
+
+公式リリースから都度ダウンロードする方式は、GitHub が 504/503 を返すと
+ビルドとリリースが通らなくなる（実測: 2 回連続で失敗）。そのため未改変の
+MSI をリポジトリに置き、CI が SHA-256 を照合してから同梱する。
 - サイズ: 2,191,360 バイト
 - 署名: NAVIMATICS LLC（有効）
 
