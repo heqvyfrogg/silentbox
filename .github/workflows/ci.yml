@@ -170,15 +170,28 @@ jobs:
             }
 
             # 3) アンインストールで元へ戻ること。
+            #
+            # NSIS のアンインストーラは自分自身を一時ディレクトリへ複製して
+            # 起動し、元のプロセスはすぐ終了する。WaitForExit は「複製が始まった
+            # 時点」で返るため、PATH の後始末が終わったことを保証しない
+            # （CI で 4115 文字のまま判定に失敗した）。
+            # そのため、PATH が元の値へ戻るまでポーリングして待つ。
             $u = Join-Path $dir "uninstall.exe"
             if (-not (Test-Path $u)) { throw "アンインストーラがありません: $u" }
             $proc = Start-Process -FilePath $u -ArgumentList "/S" -PassThru
             $proc.WaitForExit(180000) | Out-Null
-            $k4 = $key.OpenSubKey("Environment", $false)
-            $restored = [string]$k4.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
-            $k4.Close()
+
+            $restored = ""
+            $deadline = (Get-Date).AddSeconds(120)
+            while ((Get-Date) -lt $deadline) {
+              $k4 = $key.OpenSubKey("Environment", $false)
+              $restored = [string]$k4.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+              $k4.Close()
+              if ($restored -eq $long) { break }
+              Start-Sleep -Milliseconds 500
+            }
             if ($restored -ne $long) {
-              throw "アンインストール後の PATH が元と違います（$($restored.Length) 文字）"
+              throw "アンインストール後の PATH が元と違います（$($restored.Length) 文字、期待 $($long.Length) 文字）"
             }
             Write-Host "アンインストール後: $($restored.Length) 文字（元と一致）"
           } finally {
