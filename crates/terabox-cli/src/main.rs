@@ -1569,21 +1569,21 @@ async fn mount_encrypted(
                     return terabox_mount::mount_winfsp_encrypted(session, target, cipher, tuning).await;
                 }
                 eprintln!("WinFsp が見つからないため WebDAV モードで起動します。");
-                terabox_mount::mount_webdav_encrypted(session, target, port, cipher).await
+                terabox_mount::mount_webdav_encrypted(session, target, port, cipher, tuning).await
             } else {
                 if terabox_mount::fuse_available() {
-                    return terabox_mount::mount_fuse_encrypted(session, target, cipher).await;
+                    return terabox_mount::mount_fuse_encrypted(session, target, cipher, tuning).await;
                 }
                 eprintln!("FUSE が使えないため WebDAV モードで起動します。");
-                terabox_mount::mount_webdav_encrypted(session, target, port, cipher).await
+                terabox_mount::mount_webdav_encrypted(session, target, port, cipher, tuning).await
             }
         }
         MountMode::Winfsp => {
             terabox_mount::mount_winfsp_encrypted(session, target, cipher, tuning).await
         }
-        MountMode::Fuse => terabox_mount::mount_fuse_encrypted(session, target, cipher).await,
+        MountMode::Fuse => terabox_mount::mount_fuse_encrypted(session, target, cipher, tuning).await,
         MountMode::Webdav => {
-            terabox_mount::mount_webdav_encrypted(session, target, port, cipher).await
+            terabox_mount::mount_webdav_encrypted(session, target, port, cipher, tuning).await
         }
     }
 }

@@ -278,9 +278,10 @@ impl std::fmt::Debug for CryptSetup {
 pub fn encrypt_fs(
     session: Session,
     cipher: terabox_core::crypt::Cipher,
+    part_size: u64,
 ) -> anyhow::Result<Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>> {
     let api = terabox_core::api::ApiClient::new(session.clone())?;
-    let inner = Arc::new(remote::TeraBoxFs::new(api, session))
+    let inner = Arc::new(remote::TeraBoxFs::with_part_size(api, session, part_size))
         as Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>;
     Ok(Arc::new(cryptfs::CryptFs::new(inner, cipher)))
 }
@@ -338,15 +339,22 @@ pub async fn mount_fuse_encrypted(
     session: Session,
     mountpoint: &str,
     cipher: terabox_core::crypt::Cipher,
+    tuning: MountTuning,
 ) -> anyhow::Result<()> {
     #[cfg(all(unix, feature = "fuse-backend"))]
     {
-        let fs = encrypt_fs(session, cipher)?;
-        fuse_fs::mount(fs, std::path::Path::new(mountpoint), None).await
+        let fs = encrypt_fs(session, cipher, tuning.part_size)?;
+        fuse_fs::mount(
+            fs,
+            std::path::Path::new(mountpoint),
+            None,
+            tuning.threads,
+        )
+        .await
     }
     #[cfg(not(all(unix, feature = "fuse-backend")))]
     {
-        let _ = (session, mountpoint, cipher);
+        let _ = (session, mountpoint, cipher, tuning);
         anyhow::bail!("このビルドは FUSE バックエンドを含んでいません。");
     }
 }
@@ -358,7 +366,8 @@ pub async fn mount_webdav_encrypted(
     drive: &str,
     port: u16,
     cipher: terabox_core::crypt::Cipher,
+    tuning: MountTuning,
 ) -> anyhow::Result<()> {
-    let fs = encrypt_fs(session, cipher)?;
+    let fs = encrypt_fs(session, cipher, tuning.part_size)?;
     webdav::serve_fs_and_connect(fs, drive, port).await
 }
