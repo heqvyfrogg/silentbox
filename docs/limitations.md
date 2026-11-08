@@ -642,3 +642,21 @@ WinFsp の `DirMarker` は「バッファに収まる範囲で切り詰めて返
 ままだったため、T: から見えなかった。`tbx crypt-migrate / --apply
 --delete-source` で暗号化形式へ移すと一覧に出るようになり、SHA-256 も
 一致した（`EE05DBF8...DF39CE`）。
+### 原因 3: マウント経由の削除が効かない
+
+一覧が直った後、T: からファイルを消しても「Incorrect function」で失敗し、
+サーバからも消えなかった。計測すると、`del` は `set_delete` を一度も呼ばず、
+`cleanup` に flags=33 で来ていた。
+
+```
+[io] cleanup /photo2.png flags=33
+```
+
+33 = 0x21 = `FspCleanupSetLastAccessTime`(0x20) | `FspCleanupDelete`(0x01)。
+ところが `cleanup` は「削除は `set_delete` で受ける」と信じて、削除フラグが
+立っていれば即 return していた。結果として削除要求が黙って捨てられていた。
+
+`cleanup` で削除フラグが立っている場合に実際に削除するよう直した
+（`cleanup` は失敗を返せないので、失敗はログに残す）。修正後、T: からの
+削除でサーバ上からも消えること、改名も通ることを実測した。
+`FspCleanupDelete` が 0x01 であることを回帰テストで固定した。

@@ -420,9 +420,16 @@ mod imp {
             _file_name: Option<&U16CStr>,
             flags: u32,
         ) {
-            // 削除は `set_delete` で受ける（WinFsp の削除は 2 段階）。
-            // ここでは未送信の書き込みを確定させる。
+            // `del` は `set_delete` を呼ばず、`cleanup` に削除フラグを立てて
+            // 来る（実測: flags=33 = 0x20 | FspCleanupDelete(0x01)。
+            // `set_delete` は一度も呼ばれなかった）。以前はここで即 return
+            // していたため、削除が黙って捨てられ「Incorrect function」に
+            // なり、ファイルが消えなかった。
             if flags & winfsp::constants::FspCleanupFlags::FspCleanupDelete as u32 != 0 {
+                if let Err(e) = block_on(self.fs.delete(&context.path)) {
+                    // `cleanup` は失敗を返せない。ログだけ残す。
+                    eprintln!("[cleanup] {} の削除に失敗しました: {e}", context.path);
+                }
                 return;
             }
             let _ = self.persist(context);
@@ -657,6 +664,18 @@ mod imp {
             handle.buffer_write(0, b"abc", false);
             handle.buffer_write(99, b"z", true);
             assert_eq!(handle.dirty_bytes().unwrap(), b"abcz".to_vec());
+        }
+
+        #[test]
+        fn cleanup_delete_flag_is_the_delete_path() {
+            // 実測: `del` は `set_delete` を呼ばず、`cleanup` に
+            // flags=33（0x20 | FspCleanupDelete(0x01)）を立てて来る。
+            // この定数が 0x01 であることを固定する（値が変われば
+            // 削除が再び黙って捨てられる）。
+            use winfsp::constants::FspCleanupFlags;
+            assert_eq!(FspCleanupFlags::FspCleanupDelete as u32, 0x01);
+            let flags = 0x20u32 | FspCleanupFlags::FspCleanupDelete as u32;
+            assert_eq!(flags & FspCleanupFlags::FspCleanupDelete as u32, 0x01);
         }
 
         #[test]
