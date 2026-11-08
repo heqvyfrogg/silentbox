@@ -65,7 +65,20 @@ jobs:
           $msi = "install\winfsp.msi"
           $url = "https://github.com/winfsp/winfsp/releases/download/v2.1/winfsp-2.1.25156.msi"
           if (-not (Test-Path $msi)) {
-            Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 120
+            # 外部からの取得は 1 回で失敗し得る（実測: GitHub が 504 を返した）。
+          # 3 回まで間を空けて再試行し、それでも駄目なら失敗させる。
+          $ok = $false
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $msi -TimeoutSec 120
+              $ok = $true
+              break
+            } catch {
+              Write-Host "取得に失敗（$attempt 回目）: $_"
+              if ($attempt -lt 3) { Start-Sleep -Seconds (5 * $attempt) }
+            }
+          }
+          if (-not $ok) { throw "WinFsp の MSI を取得できません: $url" }
           }
           $expected = "073A70E00F77423E34BED98B86E600DEF93393BA5822204FAC57A29324DB9F7A"
           $actual = (Get-FileHash $msi -Algorithm SHA256).Hash
