@@ -108,8 +108,13 @@ mod imp {
     }
 
     /// ファイルシステム本体。
+    ///
+    /// 暗号化層（`CryptFs`）を差し込めるよう、具象 `TeraBoxFs` ではなく
+    /// `RemoteFs` のトレイトオブジェクトで持つ。容量だけは `RemoteFs` の
+    /// 契約に含まれないため、マウント側からクロージャで渡す。
     pub struct TeraBoxFsContext {
-        fs: Arc<TeraBoxFs>,
+        fs: Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>,
+        usage: Option<Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>>,
     }
 
     impl FileSystemContext for TeraBoxFsContext {
@@ -176,10 +181,11 @@ mod imp {
         ) -> winfsp::Result<()> {
             // 実際の容量をサーバから取る。取れない場合は「不明」を意味する
             // 0 を返す（推測値で 512GB のような嘘を表示しない）。
-            match block_on(self.fs.usage()) {
-                Some(usage) => {
-                    out_volume_info.total_size = usage.total;
-                    out_volume_info.free_size = usage.free;
+            let usage = self.usage.as_ref().and_then(|f| f());
+            match usage {
+                Some((total, free)) => {
+                    out_volume_info.total_size = total;
+                    out_volume_info.free_size = free;
                 }
                 None => {
                     out_volume_info.total_size = 0;
@@ -473,7 +479,25 @@ mod imp {
     pub async fn mount_with_winfsp(session: Session, drive: &str) -> anyhow::Result<()> {
         let api = terabox_core::api::ApiClient::new(session.clone())?;
         let fs = Arc::new(TeraBoxFs::new(api, session));
+        let usage_source = Arc::clone(&fs);
+        let usage: Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync> = Arc::new(move || {
+            let remote = Arc::clone(&usage_source);
+            block_on(async move { remote.usage().await }).map(|u| (u.total, u.free))
+        });
+        mount_with_fs(
+            fs as Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>,
+            drive,
+            Some(usage),
+        )
+        .await
+    }
 
+    /// 任意の `RemoteFs` を WinFsp でマウントする（暗号化層を差し込むときに使う）。
+    pub async fn mount_with_fs(
+        fs: Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>,
+        drive: &str,
+        usage: Option<Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>>,
+    ) -> anyhow::Result<()> {
         let mut params = VolumeParams::new();
         {
             let p = &mut params;
@@ -513,7 +537,7 @@ mod imp {
 
         // `FineGuard` を明示して、`CoarseGuard` 版との曖昧さを解消する。
         let mut host: FileSystemHost<TeraBoxFsContext, winfsp::host::FineGuard> =
-            FileSystemHost::new(params, TeraBoxFsContext { fs })
+            FileSystemHost::new(params, TeraBoxFsContext { fs, usage })
                 .map_err(|e| anyhow::anyhow!("WinFsp ホストを作れませんでした: {e}"))?;
 
         host.mount(drive)
@@ -538,7 +562,7 @@ mod imp {
 }
 
 #[cfg(all(windows, feature = "winfsp-backend"))]
-pub use imp::mount_with_winfsp;
+pub use imp::{mount_with_fs, mount_with_winfsp};
 
 #[cfg(not(all(windows, feature = "winfsp-backend")))]
 /// WinFsp バックエンドが無効なビルド向けのスタブ。

@@ -239,19 +239,44 @@ pub fn encrypt_fs(
 
 /// 暗号化して WinFsp でマウントする。
 ///
-/// WinFsp のホストは具象 `TeraBoxFs` を要求するため、現時点では暗号化層を
-/// 差し込めない。Windows で暗号化を使う場合は `--mode webdav`（または
-/// `--mode fuse` を含むビルド）を使う。**黙って平文でマウントしない**よう、
-/// 明示的に失敗させる。
+/// WinFsp のホストは `RemoteFs` のトレイトオブジェクトを受けるので、
+/// `CryptFs` を挟んだままドライブとして見せられる。容量だけは `RemoteFs` の
+/// 契約に無いため、平文側の `TeraBoxFs` から取って渡す。
 #[cfg(feature = "crypt")]
 pub async fn mount_winfsp_encrypted(
-    _session: Session,
-    _drive: &str,
-    _cipher: terabox_core::crypt::Cipher,
+    session: Session,
+    drive: &str,
+    cipher: terabox_core::crypt::Cipher,
 ) -> anyhow::Result<()> {
-    anyhow::bail!(
-        "暗号化と WinFsp の組み合わせは未対応です。`--mode webdav` で暗号化マウントしてください（WebDAV でも中身は暗号化されます）。"
-    )
+    if !winfsp_available() {
+        anyhow::bail!(
+            "WinFsp がインストールされていません。`--mode webdav` を使うか、https://winfsp.dev/ から WinFsp を導入してください。"
+        );
+    }
+
+    #[cfg(all(windows, feature = "winfsp-backend"))]
+    {
+        let api = terabox_core::api::ApiClient::new(session.clone())?;
+        let plain = Arc::new(remote::TeraBoxFs::new(api, session));
+
+        // 容量は平文側の実装から取る（暗号化で総量は変わらない）。
+        let usage_source = Arc::clone(&plain);
+        let usage: Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync> = Arc::new(move || {
+            let remote = Arc::clone(&usage_source);
+            crate::runtime::block_on(async move { remote.usage().await }).map(|u| (u.total, u.free))
+        });
+
+        let encrypted = cryptfs::CryptFs::new(
+            plain as Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>,
+            cipher,
+        );
+        teraboxfs::mount_with_fs(Arc::new(encrypted), drive, Some(usage)).await
+    }
+    #[cfg(not(all(windows, feature = "winfsp-backend")))]
+    {
+        let _ = (session, drive, cipher);
+        anyhow::bail!("このビルドは WinFsp バックエンドを含んでいません。");
+    }
 }
 
 /// 暗号化して FUSE でマウントする。
