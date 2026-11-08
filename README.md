@@ -163,10 +163,13 @@ tbx crypt disable                    # 無効化（保存済みの暗号文は�
 ```bash
 tbx autostart status     # 既定は無効
 tbx autostart enable     # 登録（Windows は HKCU\...\Run、Linux は systemd --user）
+tbx autostart enable --crypt   # 暗号化してマウントする
 tbx autostart disable
 ```
 
 登録するのはマウントだけ。転送やログインは自動で走らせない。
+暗号化を有効にしている場合は、`--crypt` を付けなくても暗号化付きで登録する
+（平文で生えると意図と違うため）。
 
 ## インストール
 
