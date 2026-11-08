@@ -47,8 +47,16 @@ pub fn default_target() -> String {
 }
 
 /// 登録するコマンド列（実行ファイルの絶対パス + `mount <target>`）。
-fn command_line(exe: &std::path::Path, target: &str) -> String {
-    format!("\"{}\" mount {}", exe.display(), target)
+///
+/// `crypt` が真なら `--crypt` を付ける。暗号化して運用している利用者は、
+/// 再起動後も暗号化したままマウントされてほしい（平文で生えてしまうと
+/// 意図と違う）。
+fn command_line(exe: &std::path::Path, target: &str, crypt: bool) -> String {
+    if crypt {
+        format!("\"{}\" mount {} --crypt", exe.display(), target)
+    } else {
+        format!("\"{}\" mount {}", exe.display(), target)
+    }
 }
 
 // ---- Windows ----
@@ -133,7 +141,7 @@ fn uses_custom_config_home() -> bool {
 }
 
 #[cfg(not(windows))]
-fn unit_text(exe: &std::path::Path, target: &str) -> String {
+fn unit_text(exe: &std::path::Path, target: &str, crypt: bool) -> String {
     // `Type=simple` で常駐させ、落ちたら 5 秒後に再起動する。無限再起動で
     // ログを埋めないよう `StartLimitBurst` を切る。
     format!(
@@ -145,24 +153,25 @@ fn unit_text(exe: &std::path::Path, target: &str) -> String {
          \n\
          [Service]\n\
          Type=simple\n\
-         ExecStart=\"{}\" mount {} --mode fuse\n\
+         ExecStart=\"{}\" mount {} --mode fuse{crypt}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
          \n\
          [Install]\n\
          WantedBy=default.target\n",
         exe.display(),
-        target
+        target,
+        if crypt { " --crypt" } else { "" }
     )
 }
 
 // ---- 公開 API ----
 
 /// 自動実行を登録する。既存の登録は上書きする（自分が書いたものだけ）。
-pub fn enable(target: &str) -> Result<String, String> {
+pub fn enable(target: &str, crypt: bool) -> Result<String, String> {
     let exe = std::env::current_exe()
         .map_err(|e| format!("実行ファイルの位置を特定できません: {e}"))?;
-    let command = command_line(&exe, target);
+    let command = command_line(&exe, target, crypt);
 
     #[cfg(windows)]
     {
@@ -178,7 +187,7 @@ pub fn enable(target: &str) -> Result<String, String> {
             std::fs::create_dir_all(parent)
                 .map_err(|e| format!("{} を作れません: {e}", parent.display()))?;
         }
-        let text = unit_text(&exe, target);
+        let text = unit_text(&exe, target, crypt);
         std::fs::write(&path, &text).map_err(|e| format!("{} へ書けません: {e}", path.display()))?;
 
         // 新しく書いたユニットは systemd にまだ見えていない。`daemon-reload`
@@ -259,9 +268,19 @@ mod tests {
     #[test]
     fn command_line_quotes_the_path() {
         let exe = std::path::Path::new("/tmp/with space/tbx");
-        let cmd = command_line(exe, "T:");
+        let cmd = command_line(exe, "T:", false);
         assert!(cmd.starts_with('"'), "パスは引用符で囲む: {cmd}");
         assert!(cmd.contains("mount T:"), "{cmd}");
+        assert!(!cmd.contains("--crypt"), "指定が無ければ付けない: {cmd}");
+    }
+
+    #[test]
+    fn command_line_carries_the_crypt_flag() {
+        // 暗号化して運用している利用者は、再起動後も暗号化でマウントされないと
+        // 平文で生えてしまう。
+        let exe = std::path::Path::new("/tmp/tbx");
+        let cmd = command_line(exe, "T:", true);
+        assert!(cmd.contains("mount T: --crypt"), "{cmd}");
     }
 
     #[test]
@@ -276,7 +295,8 @@ mod tests {
     #[cfg(not(windows))]
     #[test]
     fn unit_text_has_required_keys() {
-        let text = unit_text(std::path::Path::new("/usr/bin/tbx"), "/home/u/tbx");
+        let text = unit_text(std::path::Path::new("/usr/bin/tbx"), "/home/u/tbx", false);
+        assert!(!text.contains("--crypt"), "指定が無ければ付けない");
         assert!(text.contains("ExecStart="), "ExecStart が無い");
         assert!(text.contains("--mode fuse"), "FUSE を指定していない");
         assert!(text.contains("WantedBy=default.target"), "有効化の対象が無い");

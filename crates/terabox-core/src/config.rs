@@ -8,7 +8,12 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// 設定。
+///
+/// `serde(default)` を付けているため、設定ファイルには書きたい項目だけを
+/// 書ける。以前は全項目が必須で、`mount_threads` だけを書いた設定ファイルが
+/// 「missing field `user_agent`」で読めなかった（実測）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct Config {
     /// User-Agent。既定は `DEFAULT_UA` と一致させる。
     pub user_agent: String,
@@ -24,6 +29,25 @@ pub struct Config {
     pub cache_limit_mib: u64,
     /// API の基底 URL。通常は変更しない。
     pub base_url: String,
+    /// 溜めた書き込みの上限（MiB）。
+    ///
+    /// 送信は `flush` / `cleanup` で 1 回だけ行う。ここで送るのは上限の 8 倍を
+    /// 超えたときだけ（メモリの保護）。0 で上限を無効にする。
+    #[serde(default = "default_write_buffer_mib")]
+    pub write_buffer_mib: u64,
+    /// マウントの同時実行スレッド数。
+    ///
+    /// WinFsp のホストスレッドと FUSE のイベントループスレッドに使う。
+    #[serde(default = "default_mount_threads")]
+    pub mount_threads: u16,
+}
+
+fn default_write_buffer_mib() -> u64 {
+    8
+}
+
+fn default_mount_threads() -> u16 {
+    8
 }
 
 impl Default for Config {
@@ -36,6 +60,8 @@ impl Default for Config {
             players: default_players(),
             cache_limit_mib: 4096,
             base_url: crate::api::BASE.to_string(),
+            write_buffer_mib: default_write_buffer_mib(),
+            mount_threads: default_mount_threads(),
         }
     }
 }
@@ -166,6 +192,17 @@ fn write_private(path: &Path, bytes: &[u8]) -> Result<(), crate::TbxError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partial_config_uses_defaults_for_missing_keys() {
+        // `tbx config` で 1 項目だけ書いた設定ファイルが読めること。
+        // 以前は全項目必須で `missing field 'user_agent'` になった（実測）。
+        let parsed: Config =
+            toml::from_str("mount_threads = 16").expect("部分的な設定が読めるはず");
+        assert_eq!(parsed.mount_threads, 16);
+        assert_eq!(parsed.user_agent, crate::DEFAULT_UA);
+        assert_eq!(parsed.write_buffer_mib, 8);
+    }
 
     #[test]
     fn defaults_are_sane() {

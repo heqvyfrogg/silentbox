@@ -104,6 +104,19 @@ impl Downloader {
         })
     }
 
+    /// 既存の `Client` を使って作る。
+    ///
+    /// `new` は呼ぶたびに接続プールを作る。マウントの読み出しは 1 チャンクごとに
+    /// `read_range` を呼ぶため、毎回作るとハンドシェイクとプールの初期化が
+    /// 積み上がる。マウント側は 1 個を作って使い回す。
+    pub fn with_client(session: &Session, client: Client) -> Self {
+        Self {
+            client,
+            cookie: format!("ndus={}; PANWEB=1", session.ndus),
+            session: session.clone(),
+        }
+    }
+
     /// dlink からファイルを取得する。`on_progress` は進捗のたびに呼ばれる。
     pub async fn download<F>(
         &self,

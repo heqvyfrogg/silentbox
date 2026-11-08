@@ -636,6 +636,7 @@ pub async fn mount(
     fs: Arc<dyn RemoteFs + Send + Sync>,
     mountpoint: &Path,
     usage: Option<Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>>,
+    threads: usize,
 ) -> anyhow::Result<()> {
     if !mountpoint.exists() {
         anyhow::bail!("マウント先がありません: {}", mountpoint.display());
@@ -658,6 +659,13 @@ pub async fn mount(
         MountOption::FSName("silentbox".to_string()),
         MountOption::DefaultPermissions,
     ];
+    // fuser の既定は 1 スレッド。読み出しは HTTP 待ちが支配的なので、
+    // 並列度を上げる。Linux では clone_fd で各スレッドに専用 fd を割り当てる。
+    config.n_threads = Some(threads.max(1));
+    #[cfg(target_os = "linux")]
+    {
+        config.clone_fd = true;
+    }
 
     let mut filesystem = TeraBoxFuse::new(fs);
     if let Some(usage) = usage {

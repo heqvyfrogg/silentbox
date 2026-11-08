@@ -232,6 +232,9 @@ enum AutostartAction {
         /// マウント先（Windows はドライブレター、Unix はディレクトリ）。
         #[arg(long)]
         target: Option<String>,
+        /// 暗号化してマウントする（`--crypt` を登録内容へ含める）。
+        #[arg(long)]
+        crypt: bool,
     },
     /// 自動マウントを無効にする。
     Disable,
@@ -1360,15 +1363,50 @@ async fn cmd_mkdir(path: &str, json: bool) -> Result<()> {
     Ok(())
 }
 
+/// 設定からマウントの調整値を組み立てる。
+///
+/// 設定が読めない場合でも既定値で動かす（マウントを止める理由にはしない）。
+fn mount_tuning() -> terabox_mount::MountTuning {
+    match Config::load() {
+        Ok(cfg) => terabox_mount::MountTuning {
+            write_buffer: (cfg.write_buffer_mib as usize).saturating_mul(1024 * 1024),
+            threads: usize::from(cfg.mount_threads).clamp(1, 32),
+            part_size: cfg.part_size_mib.saturating_mul(1024 * 1024).max(1024 * 1024),
+        },
+        Err(e) => {
+            eprintln!("設定を読めないため既定値でマウントします: {e}");
+            terabox_mount::MountTuning::default()
+        }
+    }
+}
+
+/// 暗号化が有効か（自動起動の登録内容を決めるのに使う）。
+///
+/// `crypt` feature が無いビルドでは常に false。設定が読めない場合も false
+/// （読めないことを暗号化の指示と解釈しない）。
+fn crypt_enabled_for_autostart() -> bool {
+    #[cfg(feature = "crypt")]
+    {
+        return terabox_core::crypt::CryptConfig::load()
+            .map(|c| c.enabled)
+            .unwrap_or(false);
+    }
+    #[cfg(not(feature = "crypt"))]
+    {
+        false
+    }
+}
+
 async fn cmd_mount(target: &str, mode: MountMode, port: u16, crypt: bool) -> Result<()> {
     let client = api().await?;
     let session = client.session().await;
+    let tuning = mount_tuning();
 
     #[cfg(feature = "crypt")]
     {
         // `--crypt` か設定のいずれかが有効なら暗号化でマウントする。
         if crypt || crypt_config_enabled()? {
-            return mount_encrypted(session, target, mode, port).await;
+            return mount_encrypted(session, target, mode, port, tuning).await;
         }
     }
     #[cfg(not(feature = "crypt"))]
@@ -1388,22 +1426,22 @@ async fn cmd_mount(target: &str, mode: MountMode, port: u16, crypt: bool) -> Res
             // OS ごとに最も自然な方式を選ぶ。Windows は WinFsp、Unix は FUSE。
             if cfg!(windows) {
                 if terabox_mount::winfsp_available() {
-                    return terabox_mount::mount_winfsp(session, target).await;
+                    return terabox_mount::mount_winfsp_tuned(session, target, tuning).await;
                 }
                 eprintln!("WinFsp が見つからないため WebDAV モードで起動します。");
                 eprintln!("（WinFsp を入れるとエクスプローラの仮想ファイルとして扱えます）");
                 terabox_mount::mount_webdav(session, target, port).await
             } else {
                 if terabox_mount::fuse_available() {
-                    return terabox_mount::mount_fuse(session, target).await;
+                    return terabox_mount::mount_fuse_tuned(session, target, tuning).await;
                 }
                 eprintln!("FUSE が使えないため WebDAV モードで起動します。");
                 eprintln!("（--features fuse-backend でビルドし、/dev/fuse を用意してください）");
                 terabox_mount::mount_webdav(session, target, port).await
             }
         }
-        MountMode::Winfsp => terabox_mount::mount_winfsp(session, target).await,
-        MountMode::Fuse => terabox_mount::mount_fuse(session, target).await,
+        MountMode::Winfsp => terabox_mount::mount_winfsp_tuned(session, target, tuning).await,
+        MountMode::Fuse => terabox_mount::mount_fuse_tuned(session, target, tuning).await,
         MountMode::Webdav => terabox_mount::mount_webdav(session, target, port).await,
     }
 }
@@ -1461,11 +1499,19 @@ async fn cmd_autostart(action: AutostartAction, json: bool) -> Result<()> {
             }
             Ok(())
         }
-        AutostartAction::Enable { target } => {
+        AutostartAction::Enable { target, crypt } => {
             let target = target.unwrap_or_else(autostart::default_target);
-            eprintln!("次の内容で登録します: `tbx mount {target}`");
+            // 暗号化が有効な環境では、指定が無くても暗号化で登録する。
+            // 平文で生えると利用者の意図と違う。
+            let use_crypt = crypt || crypt_enabled_for_autostart();
+            let what = if use_crypt {
+                format!("`tbx mount {target} --crypt`")
+            } else {
+                format!("`tbx mount {target}`")
+            };
+            eprintln!("次の内容で登録します: {what}");
             eprintln!("（PC 起動時に自動でマウントします。ログイン済みである必要があります）");
-            let command = autostart::enable(&target).map_err(|e| anyhow!(e))?;
+            let command = autostart::enable(&target, use_crypt).map_err(|e| anyhow!(e))?;
             if json {
                 println!(
                     "{}",
@@ -1498,6 +1544,7 @@ async fn mount_encrypted(
     target: &str,
     mode: MountMode,
     port: u16,
+    tuning: terabox_mount::MountTuning,
 ) -> Result<()> {
     use terabox_core::crypt::{Cipher, CryptConfig};
 
@@ -1519,7 +1566,7 @@ async fn mount_encrypted(
         MountMode::Auto => {
             if cfg!(windows) {
                 if terabox_mount::winfsp_available() {
-                    return terabox_mount::mount_winfsp_encrypted(session, target, cipher).await;
+                    return terabox_mount::mount_winfsp_encrypted(session, target, cipher, tuning).await;
                 }
                 eprintln!("WinFsp が見つからないため WebDAV モードで起動します。");
                 terabox_mount::mount_webdav_encrypted(session, target, port, cipher).await
@@ -1532,7 +1579,7 @@ async fn mount_encrypted(
             }
         }
         MountMode::Winfsp => {
-            terabox_mount::mount_winfsp_encrypted(session, target, cipher).await
+            terabox_mount::mount_winfsp_encrypted(session, target, cipher, tuning).await
         }
         MountMode::Fuse => terabox_mount::mount_fuse_encrypted(session, target, cipher).await,
         MountMode::Webdav => {

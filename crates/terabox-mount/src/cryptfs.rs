@@ -10,17 +10,35 @@
 //! 平文の名前がそのまま見えて「暗号化されている」という前提が崩れる。
 //! 落とした件数は stderr に 1 行だけ出す（黙って消さない）。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use terabox_core::crypt::Cipher;
 use terabox_core::models::FsEntry;
 use terabox_core::vfs::{normalize_path, parent_path, RemoteFs, RemoteMeta};
 use terabox_core::TbxError;
 
+/// 暗号ヘッダのキャッシュ有効期間。
+///
+/// ヘッダは magic と nonce（32 バイト）で、ファイル作成時に決まり以後変わらない。
+/// 読み出しのたびに 32 バイトを取りに行くと HTTP の往復が 1 回増える。
+const HEADER_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// 平文パスごとの暗号ヘッダ。
+struct HeaderEntry {
+    header: Vec<u8>,
+    /// キャッシュした時点の暗号文サイズ。サイズが変われば作り直しとみなす。
+    sealed_size: u64,
+    fetched: Instant,
+}
+
 /// 暗号化層。
 pub struct CryptFs {
     inner: Arc<dyn RemoteFs + Send + Sync>,
     cipher: Arc<Cipher>,
+    /// 暗号ヘッダのキャッシュ（平文パス -> ヘッダ）。
+    headers: Mutex<HashMap<String, HeaderEntry>>,
 }
 
 impl CryptFs {
@@ -29,7 +47,50 @@ impl CryptFs {
         Self {
             inner,
             cipher: Arc::new(cipher),
+            headers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// 暗号ヘッダを取得する（キャッシュ経由）。
+    ///
+    /// `inner_size` は暗号文全体のサイズ。ファイルが作り直されるとサイズが
+    /// 変わるので、それを見てキャッシュを捨てる。
+    async fn header_for(
+        &self,
+        remote: &str,
+        plain: &str,
+        inner_size: u64,
+    ) -> Result<Vec<u8>, TbxError> {
+        {
+            let cache = self.headers.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = cache.get(plain) {
+                if hit.fetched.elapsed() < HEADER_TTL && hit.sealed_size == inner_size {
+                    return Ok(hit.header.clone());
+                }
+            }
+        }
+        let header = self
+            .inner
+            .read_range(remote, 0, terabox_core::crypt::HEADER_SIZE as u64)
+            .await?;
+        {
+            let mut cache = self.headers.lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(
+                plain.to_string(),
+                HeaderEntry {
+                    header: header.clone(),
+                    sealed_size: inner_size,
+                    fetched: Instant::now(),
+                },
+            );
+        }
+        Ok(header)
+    }
+
+    /// ヘッダのキャッシュを捨てる（復号の認証に失敗したとき）。
+    fn forget_header(&self, plain: &str) {
+        let mut cache = self.headers.lock().unwrap_or_else(|e| e.into_inner());
+        cache.remove(plain);
     }
 
     /// 平文パスを暗号化パスへ。`is_dir` で最後のセグメントの扱いが変わる。
@@ -126,25 +187,51 @@ impl RemoteFs for CryptFs {
         }
         let remote = self.to_remote(path, false);
 
-        // ヘッダ（magic + nonce）と、必要なブロックだけを読む。どちらも非同期で
-        // 取得してから、復号は同期的な純関数で行う（ランタイムの再入を避ける）。
-        let header = self
-            .inner
-            .read_range(&remote, 0, terabox_core::crypt::HEADER_SIZE as u64)
-            .await?;
+        // 暗号文のサイズは内側のメタ情報から取る（ヘッダキャッシュの判定に使う）。
+        // ファイルが作り直されるとサイズが変わるので、それを見て捨てる。
+        let inner_size = self.inner.metadata(&remote).await?.map(|m| m.size).unwrap_or(0);
+
+        // ヘッダ（magic + nonce、32 バイト）は 1 回だけ取ってキャッシュする。
+        // ファイル作成時に決まり以後変わらないため、読み出しのたびに取りに
+        // 行くと HTTP の往復が 1 回増えるだけになる。
+        let mut header = self.header_for(&remote, path, inner_size).await?;
+
         let (start, end) = self.cipher.range_plan(offset, length);
         let want = end.saturating_sub(start);
-        let body = self.inner.read_range(&remote, start, want).await?;
-        self.cipher.decrypt_range_from(offset, length, &header, &body)
+        let mut body = self.inner.read_range(&remote, start, want).await?;
+
+        match self
+            .cipher
+            .decrypt_range_from(offset, length, &header, &body)
+        {
+            Ok(data) => Ok(data),
+            Err(first_error) => {
+                // ヘッダが古い（ファイルが作り直された）可能性がある。キャッシュを
+                // 捨てて取り直し、もう一度だけ試す。それでも失敗したら元のエラーを
+                // 返す（無限ループにしない）。
+                self.forget_header(path);
+                header = self
+                    .inner
+                    .read_range(&remote, 0, terabox_core::crypt::HEADER_SIZE as u64)
+                    .await?;
+                body = self.inner.read_range(&remote, start, want).await?;
+                self.cipher
+                    .decrypt_range_from(offset, length, &header, &body)
+                    .map_err(|_| first_error)
+            }
+        }
     }
 
     async fn write(&self, path: &str, data: &[u8]) -> Result<(), TbxError> {
         let remote = self.to_remote(path, false);
         let sealed = self.cipher.encrypt_data(data);
+        // 作り直すと nonce が変わる。古いヘッダを握り続けないよう捨てる。
+        self.forget_header(path);
         self.inner.write(&remote, &sealed).await
     }
 
     async fn delete(&self, path: &str) -> Result<(), TbxError> {
+        self.forget_header(path);
         // ファイル名とディレクトリ名の両方を試す。
         let mut last_error = None;
         for is_dir in [false, true] {
@@ -160,6 +247,8 @@ impl RemoteFs for CryptFs {
     }
 
     async fn rename(&self, from: &str, to: &str) -> Result<(), TbxError> {
+        self.forget_header(from);
+        self.forget_header(to);
         // ディレクトリかファイルか分からないので、両方の組み合わせを試す。
         let mut last_error = None;
         for is_dir in [false, true] {
@@ -197,6 +286,8 @@ mod tests {
     /// メモリ上の偽リモート。暗号化された名前と中身だけを持つ。
     struct FakeRemote {
         entries: Mutex<HashMap<String, (Vec<u8>, bool)>>,
+        /// `read_range` が呼ばれた回数（ヘッダ取得の重複を数える）。
+        reads: std::sync::atomic::AtomicUsize,
     }
 
     impl FakeRemote {
@@ -205,7 +296,17 @@ mod tests {
             map.insert("/".to_string(), (Vec::new(), true));
             Self {
                 entries: Mutex::new(map),
+                reads: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        fn read_count(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn reset_reads(&self) {
+            self.reads
+                .store(0, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -262,6 +363,8 @@ mod tests {
             offset: u64,
             length: u64,
         ) -> Result<Vec<u8>, TbxError> {
+            self.reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let data = self.read(path).await?;
             let start = (offset as usize).min(data.len());
             let end = (start + length as usize).min(data.len());
@@ -370,6 +473,47 @@ mod tests {
             let end = (start + length as usize).min(plain.len());
             assert_eq!(got, plain[start..end].to_vec(), "offset={offset}");
         }
+    }
+
+    #[tokio::test]
+    async fn header_is_read_once_and_cached() {
+        let inner = Arc::new(FakeRemote::new());
+        let cipher = Cipher::new("password", "salt", &CryptConfig::default()).expect("鍵");
+        let fs = CryptFs::new(
+            Arc::clone(&inner) as Arc<dyn RemoteFs + Send + Sync>,
+            cipher,
+        );
+        fs.write("/h.bin", b"0123456789").await.unwrap();
+
+        // 1 回目の読み出しはヘッダ + 本文で 2 回。
+        inner.reset_reads();
+        fs.read_range("/h.bin", 2, 4).await.unwrap();
+        let first = inner.read_count();
+        assert_eq!(first, 2, "初回はヘッダと本文で 2 回のはず: {first}");
+
+        // 2 回目以降はヘッダがキャッシュされ、本文の 1 回だけで済む。
+        inner.reset_reads();
+        fs.read_range("/h.bin", 5, 3).await.unwrap();
+        let second = inner.read_count();
+        assert_eq!(second, 1, "ヘッダはキャッシュされ 1 回だけになるはず: {second}");
+    }
+
+    #[tokio::test]
+    async fn header_cache_is_dropped_when_file_is_rewritten() {
+        let inner = Arc::new(FakeRemote::new());
+        let cipher = Cipher::new("password", "salt", &CryptConfig::default()).expect("鍵");
+        let fs = CryptFs::new(
+            Arc::clone(&inner) as Arc<dyn RemoteFs + Send + Sync>,
+            cipher,
+        );
+        fs.write("/r.bin", &vec![1u8; 1000]).await.unwrap();
+        let before = fs.read_range("/r.bin", 0, 10).await.unwrap();
+
+        // サイズを変えて作り直す。ヘッダキャッシュはサイズの変化で捨てられる。
+        fs.write("/r.bin", &vec![2u8; 2000]).await.unwrap();
+        let after = fs.read_range("/r.bin", 0, 10).await.unwrap();
+        assert_eq!(after, vec![2u8; 10], "作り直した内容が返るはず");
+        assert_ne!(before, after, "以前の内容と区別できるはず");
     }
 
     #[tokio::test]

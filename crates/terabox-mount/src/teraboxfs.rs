@@ -75,6 +75,13 @@ mod imp {
         is_dir: bool,
         /// 書き込み途中の内容。`None` は「変更なし」。
         pending: std::sync::Mutex<Option<Vec<u8>>>,
+        /// 次に途中送信する長さ。送るたびに倍にする。
+        ///
+        /// TeraBox は全体置換しか提供しないため、閾値で送るたびに「それまでの
+        /// 全量」を送り直すことになる。固定閾値だと、閾値を超えてからは
+        /// 書き込みのたびに全量再送になり二乗で遅くなる（実測: 100 MiB の
+        /// 書き込みが 0.28 MiB/s）。閾値を倍々に伸ばせば、再送は log2 回で済む。
+        next_spill: std::sync::Mutex<Option<usize>>,
     }
 
     impl FsHandle {
@@ -83,12 +90,32 @@ mod imp {
                 path,
                 is_dir,
                 pending: std::sync::Mutex::new(None),
+                next_spill: std::sync::Mutex::new(None),
             }
+        }
+
+        /// 次に途中送信すべき長さを返し、閾値を倍へ進める。
+        ///
+        /// `base` は最初の閾値。まだ設定されていれば `base` から始める。
+        fn take_spill_threshold(&self, base: usize) -> usize {
+            let mut guard = self.next_spill.lock().unwrap_or_else(|e| e.into_inner());
+            let current = guard.unwrap_or(base);
+            let next = current.saturating_mul(2);
+            *guard = Some(next);
+            current
         }
 
         fn dirty_bytes(&self) -> Option<Vec<u8>> {
             let guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             guard.clone()
+        }
+
+        /// 溜めている書き込みの長さ。`dirty_bytes` は全体を clone するため、
+        /// 送るかどうかの判定にはこちらを使う（書き込みのたびに全体を
+        /// コピーすると、細かい書き込みが続くほど二乗で遅くなる）。
+        fn dirty_len(&self) -> usize {
+            let guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().map(|v| v.len()).unwrap_or(0)
         }
 
         /// 書き込みを溜める。`offset` が現在長より先なら 0 で埋める。
@@ -107,6 +134,13 @@ mod imp {
         }
     }
 
+    /// 書き込みを溜めてから送る閾値の既定値（8 MiB）。
+    ///
+    /// `write` のたびに全体を送ると、N 回に分けて書くアプリでは N 回の全量
+    /// アップロードになる（暗号化時はそのたびに全体を暗号化する）。閾値までは
+    /// 溜め、超えたら送る。`flush` と `cleanup` で必ず送る。
+    const DEFAULT_WRITE_BUFFER: usize = 8 * 1024 * 1024;
+
     /// ファイルシステム本体。
     ///
     /// 暗号化層（`CryptFs`）を差し込めるよう、具象 `TeraBoxFs` ではなく
@@ -115,6 +149,8 @@ mod imp {
     pub struct TeraBoxFsContext {
         fs: Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>,
         usage: Option<Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>>,
+        /// 書き込みを溜めてから送る閾値（バイト）。0 なら毎回送る。
+        write_buffer: usize,
     }
 
     impl FileSystemContext for TeraBoxFsContext {
@@ -280,6 +316,7 @@ mod imp {
             offset: u64,
         ) -> winfsp::Result<u32> {
             let want = buffer.len().min(MAX_READ) as u64;
+
             if want == 0 {
                 return Ok(0);
             }
@@ -316,32 +353,42 @@ mod imp {
             _constrained_io: bool,
             file_info: &mut FileInfo,
         ) -> winfsp::Result<u32> {
-            // バッファへ書き、その場で送信する。
+            // バッファへ溜めるだけにする。送信は `flush` と `cleanup` だけ。
             //
-            // `flush` / `cleanup` に送信を遅らせると、`cleanup` が失敗を返せない
-            // 仕様のため、送信に失敗しても呼び出し元には成功として見える
-            // （実測: サーバが `need verify` を返している間、書き込みが成功した
-            // ように見えて実際には何も保存されなかった）。`write` は失敗を
-            // 返せるので、ここで送るのが唯一「正直に失敗できる」経路になる。
-            //
-            // 1 回の書き込みごとに全体を送り直すため、細かい追記が続く書き方では
-            // 送信回数が増える。正しさを優先した割り切りである。
+            // TeraBox の API はオブジェクト全体の置き換えしか提供しない。途中で
+            // 送ると「まだ書き込み途中の内容で丸ごと上書き」したうえ、続きが
+            // 来るたびにまた全体を送ることになり、転送量が二乗に増える（実測:
+            // 20 MiB の書き込みで 8 MiB 以降の毎回の write が全量再送になり、
+            // 34.6 秒かかった）。`flush` は失敗を返せる確定点なので、そこで
+            // 1 回だけ送れば足りる。
             context.buffer_write(offset, buffer, write_to_eof);
-            let buf = context.dirty_bytes().unwrap_or_default();
-            if let Err(e) = block_on(self.fs.write(&context.path, &buf)) {
-                eprintln!("[write] {} の送信に失敗しました: {e}", context.path);
-                // 失敗した内容は捨てる（同じ内容を送り続けない）。
-                {
-                    let mut guard = context
-                        .pending
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    *guard = None;
+            let len = context.dirty_len();
+
+            // 閾値 0 でなければ、巨大なファイルでメモリを圧迫しないよう、
+            // 一定量を超えたら途中送信する。閾値は倍々に伸ばすので、再送は
+            // log2 回に収まる（固定値だと二乗で遅くなる。実測あり）。
+            // 通常の使い方（`flush` が来る書き方）ではここは通らない。
+            let spill_at = if self.write_buffer == 0 {
+                0
+            } else {
+                context.take_spill_threshold(self.write_buffer.saturating_mul(8))
+            };
+            if spill_at > 0 && len >= spill_at {
+                let buf = context.dirty_bytes().unwrap_or_default();
+                if let Err(e) = block_on(self.fs.write(&context.path, &buf)) {
+                    eprintln!("[write] {} の送信に失敗しました: {e}", context.path);
+                    {
+                        let mut guard = context
+                            .pending
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        *guard = None;
+                    }
+                    return Err(FspError::IO(ErrorKind::Other));
                 }
-                return Err(FspError::IO(ErrorKind::Other));
             }
-            file_info.file_size = buf.len() as u64;
-            file_info.allocation_size = buf.len() as u64;
+            file_info.file_size = len as u64;
+            file_info.allocation_size = len as u64;
             Ok(buffer.len() as u32)
         }
 
@@ -458,7 +505,16 @@ mod imp {
                 return Ok(());
             }
 
+            let started = std::time::Instant::now();
             let result = block_on(self.fs.write(&handle.path, &buf));
+            if std::env::var_os("TBX_TRACE_IO").is_some() {
+                eprintln!(
+                    "[io] upload {} bytes={} micros={}",
+                    handle.path,
+                    buf.len(),
+                    started.elapsed().as_micros()
+                );
+            }
             // 失敗してもバッファは捨てる。残すと同じ内容を送り続ける。
             let mut guard = handle.pending.lock().unwrap_or_else(|e| e.into_inner());
             *guard = None;
@@ -477,8 +533,17 @@ mod imp {
 
     /// WinFsp でマウントする。Ctrl+C まで戻らない。
     pub async fn mount_with_winfsp(session: Session, drive: &str) -> anyhow::Result<()> {
+        crate::teraboxfs::mount_with_winfsp_tuned(session, drive, crate::MountTuning::default()).await
+    }
+
+    /// 調整値を指定して WinFsp でマウントする。
+    pub async fn mount_with_winfsp_tuned(
+        session: Session,
+        drive: &str,
+        tuning: crate::MountTuning,
+    ) -> anyhow::Result<()> {
         let api = terabox_core::api::ApiClient::new(session.clone())?;
-        let fs = Arc::new(TeraBoxFs::new(api, session));
+        let fs = Arc::new(TeraBoxFs::with_part_size(api, session, tuning.part_size));
         let usage_source = Arc::clone(&fs);
         let usage: Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync> = Arc::new(move || {
             let remote = Arc::clone(&usage_source);
@@ -488,6 +553,8 @@ mod imp {
             fs as Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>,
             drive,
             Some(usage),
+            tuning.write_buffer,
+            tuning.threads,
         )
         .await
     }
@@ -497,6 +564,8 @@ mod imp {
         fs: Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>,
         drive: &str,
         usage: Option<Arc<dyn Fn() -> Option<(u64, u64)> + Send + Sync>>,
+        write_buffer: usize,
+        threads: usize,
     ) -> anyhow::Result<()> {
         let mut params = VolumeParams::new();
         {
@@ -537,14 +606,16 @@ mod imp {
 
         // `FineGuard` を明示して、`CoarseGuard` 版との曖昧さを解消する。
         let mut host: FileSystemHost<TeraBoxFsContext, winfsp::host::FineGuard> =
-            FileSystemHost::new(params, TeraBoxFsContext { fs, usage })
+            FileSystemHost::new(params, TeraBoxFsContext { fs, usage, write_buffer })
                 .map_err(|e| anyhow::anyhow!("WinFsp ホストを作れませんでした: {e}"))?;
 
         host.mount(drive)
             .map_err(|e| anyhow::anyhow!("{drive} をマウントできませんでした: {e}"))?;
         println!("{drive} に TeraBox をマウントしました。Ctrl+C で終了します。");
 
-        host.start_with_threads(4)
+        // 以前は 4 固定。読み出しは dlink キャッシュで軽くなったので、
+        // 同時に走る範囲取得を増やして待ち時間を減らす。
+        host.start_with_threads(threads.max(1) as u32)
             .map_err(|e| anyhow::anyhow!("WinFsp を開始できませんでした: {e}"))?;
 
         let _ = init;
@@ -559,10 +630,65 @@ mod imp {
     /// 未使用の型参照を型チェックに載せる（将来の通知実装用）。
     #[allow(dead_code)]
     fn _keep(_b: DirBuffer) {}
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn write_buffers_without_losing_bytes() {
+            let handle = FsHandle::new("/b.bin".to_string(), false);
+            handle.buffer_write(0, b"abc", false);
+            handle.buffer_write(3, b"def", false);
+            assert_eq!(handle.dirty_len(), 6);
+            assert_eq!(handle.dirty_bytes().unwrap(), b"abcdef".to_vec());
+        }
+
+        #[test]
+        fn write_fills_gaps_with_zero() {
+            let handle = FsHandle::new("/g.bin".to_string(), false);
+            handle.buffer_write(4, b"xy", false);
+            assert_eq!(handle.dirty_len(), 6);
+            assert_eq!(handle.dirty_bytes().unwrap(), b"\0\0\0\0xy".to_vec());
+        }
+
+        #[test]
+        fn append_ignores_the_given_offset() {
+            let handle = FsHandle::new("/a.bin".to_string(), false);
+            handle.buffer_write(0, b"abc", false);
+            handle.buffer_write(99, b"z", true);
+            assert_eq!(handle.dirty_bytes().unwrap(), b"abcz".to_vec());
+        }
+
+        #[test]
+        fn clearing_the_buffer_after_a_send_makes_it_dirty_free() {
+            let handle = FsHandle::new("/c.bin".to_string(), false);
+            handle.buffer_write(0, b"abc", false);
+            assert_eq!(handle.dirty_len(), 3);
+            {
+                let mut guard = handle.pending.lock().unwrap_or_else(|e| e.into_inner());
+                *guard = None;
+            }
+            assert_eq!(handle.dirty_len(), 0, "送信後は未送信バイトが 0 になるはず");
+            assert!(handle.dirty_bytes().is_none());
+        }
+    }
 }
 
 #[cfg(all(windows, feature = "winfsp-backend"))]
-pub use imp::{mount_with_fs, mount_with_winfsp};
+pub use imp::{mount_with_fs, mount_with_winfsp, mount_with_winfsp_tuned};
+
+#[cfg(not(all(windows, feature = "winfsp-backend")))]
+/// WinFsp バックエンドが無効なビルド向けのスタブ。
+pub async fn mount_with_winfsp_tuned(
+    _session: terabox_core::session::Session,
+    _drive: &str,
+    _tuning: crate::MountTuning,
+) -> anyhow::Result<()> {
+    anyhow::bail!(
+        "このビルドは WinFsp バックエンドを含んでいません。`--features winfsp-backend` と MSVC ターゲットでビルドしてください。`tbx mount <drive>: --mode webdav` も使えます。"
+    )
+}
 
 #[cfg(not(all(windows, feature = "winfsp-backend")))]
 /// WinFsp バックエンドが無効なビルド向けのスタブ。

@@ -24,6 +24,33 @@ const CACHE_TTL: Duration = Duration::from_secs(15);
 /// 残量は書き込みで変わるが、毎回 `/api/quota` を叩くと重い。30 秒で取り替える。
 const QUOTA_TTL: Duration = Duration::from_secs(30);
 
+/// dlink のキャッシュ有効期間。
+///
+/// dlink は `/rest/2.0/pcs/file` を 1 往復して得る署名付き URL。マウントの
+/// 読み出しは 1 チャンクごとに `read_range` を呼ぶので、毎回取り直すと
+/// HTTP の往復が倍になる。dlink は失効し得るため、403 が返ったら捨てて
+/// 1 回だけ取り直す。
+const DLINK_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// `TBX_TRACE_IO=1` のとき、計測用の 1 行を stderr へ出す。
+///
+/// 速度改善を体感ではなく回数と時間で示すための仕掛け。通常は無効。
+fn trace_io(kind: &str, path: &str, offset: u64, bytes: u64, micros: u128, extra: &str) {
+    if std::env::var_os("TBX_TRACE_IO").is_none() {
+        return;
+    }
+    eprintln!(
+        "[io] {kind} {path} offset={offset} bytes={bytes} micros={micros} {extra}"
+    );
+}
+
+/// 平文パスごとの dlink とサイズ。
+struct DlinkEntry {
+    dlink: String,
+    size: u64,
+    fetched: Instant,
+}
+
 struct CacheEntry {
     entries: Vec<FsEntry>,
     fetched: Instant,
@@ -41,20 +68,71 @@ pub struct VolumeUsage {
 /// TeraBox を `RemoteFs` として使うアダプタ。
 pub struct TeraBoxFs {
     api: ApiClient,
-    session: Session,
     cache: Mutex<HashMap<String, CacheEntry>>,
     /// 容量の短期キャッシュ。`None` は「まだ取れていない」。
     quota: Mutex<Option<(VolumeUsage, Instant)>>,
+    /// dlink のキャッシュ（平文パス -> 署名付き URL）。
+    dlinks: Mutex<HashMap<String, DlinkEntry>>,
+    /// 読み出し用の HTTP クライアント。1 個を作って使い回す。
+    downloader: Downloader,
+    /// 書き込みで使う分割サイズ。
+    part_size: u64,
 }
 
 impl TeraBoxFs {
     pub fn new(api: ApiClient, session: Session) -> Self {
+        Self::with_part_size(api, session, 4 * 1024 * 1024)
+    }
+
+    /// 分割サイズを指定して作る。
+    ///
+    /// `part_size` を大きくすると、大きいファイルのアップロードでパート数が
+    /// 減り、`precreate` とパート送信の往復が減る。
+    pub fn with_part_size(api: ApiClient, session: Session, part_size: u64) -> Self {
+        // 読み出し用のクライアントは 1 個だけ作る（`read_range` ごとに作らない）。
+        let downloader = Downloader::new(&session).expect("ダウンロード用クライアントを作れませんでした");
         Self {
             api,
-            session,
             cache: Mutex::new(HashMap::new()),
             quota: Mutex::new(None),
+            dlinks: Mutex::new(HashMap::new()),
+            downloader,
+            part_size,
         }
+    }
+
+    /// dlink を取り出す（キャッシュ経由）。サイズが変わっていたら取り直す。
+    async fn dlink_for(&self, path: &str, size: u64) -> Result<String, TbxError> {
+        {
+            let cache = self.dlinks.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = cache.get(path) {
+                if hit.fetched.elapsed() < DLINK_TTL && hit.size == size {
+                    trace_io("dlink", path, 0, 0, 0, "cache=hit");
+                    return Ok(hit.dlink.clone());
+                }
+            }
+        }
+        let started = Instant::now();
+        let dlink = self.api.dlink(path).await?;
+        trace_io("dlink", path, 0, 0, started.elapsed().as_micros(), "cache=miss");
+        {
+            let mut cache = self.dlinks.lock().unwrap_or_else(|e| e.into_inner());
+            cache.insert(
+                path.to_string(),
+                DlinkEntry {
+                    dlink: dlink.clone(),
+                    size,
+                    fetched: Instant::now(),
+                },
+            );
+        }
+        Ok(dlink)
+    }
+
+    /// キャッシュした dlink を捨てる（403 のとき）。
+    fn forget_dlink(&self, path: &str) {
+        let mut cache = self.dlinks.lock().unwrap_or_else(|e| e.into_inner());
+        cache.remove(path);
     }
 
     /// サーバの容量と残量を返す。取れなければ `None`（推測値で埋めない）。
@@ -181,12 +259,38 @@ impl RemoteFs for TeraBoxFs {
             return Ok(Vec::new());
         }
 
-        let dlink = self.api.dlink(&meta.path).await?;
-        let downloader = Downloader::new(&self.session)?;
-        downloader
-            .read_range(&dlink, offset, want)
-            .await
-            .map_err(|e| TbxError::Other(e.to_string()))
+        let dlink = self.dlink_for(&meta.path, meta.size).await?;
+        let started = Instant::now();
+        let first = self.downloader.read_range(&dlink, offset, want).await;
+
+        match first {
+            Ok(data) => {
+                trace_io(
+                    "range",
+                    &meta.path,
+                    offset,
+                    data.len() as u64,
+                    started.elapsed().as_micros(),
+                    "",
+                );
+                Ok(data)
+            }
+            Err(e) => {
+                // dlink は失効し得る。403（errno -6）が返ったらキャッシュを捨てて
+                // 1 回だけ取り直す。それでも失敗したらそのまま返す（無限ループに
+                // しない）。
+                if matches!(&e, TbxError::Api(err) if err.errno == -6) {
+                    self.forget_dlink(&meta.path);
+                    let dlink = self.dlink_for(&meta.path, meta.size).await?;
+                    self.downloader
+                        .read_range(&dlink, offset, want)
+                        .await
+                        .map_err(|e| TbxError::Other(e.to_string()))
+                } else {
+                    Err(TbxError::Other(e.to_string()))
+                }
+            }
+        }
     }
 
     async fn write(&self, path: &str, data: &[u8]) -> Result<(), TbxError> {
@@ -211,7 +315,7 @@ impl RemoteFs for TeraBoxFs {
             local_path: tmp.path().to_path_buf(),
             remote_dir: parent_path(&normalized),
             remote_name: Some(base_name(&normalized)),
-            part_size: 4 * 1024 * 1024,
+            part_size: self.part_size,
         };
         let result = uploader
             .upload(&req, &mut ledger, |_| {})

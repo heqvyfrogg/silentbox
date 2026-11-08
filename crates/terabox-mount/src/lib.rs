@@ -156,8 +156,38 @@ pub fn fuse_available() -> bool {
     }
 }
 
+/// マウントの調整値。既定値を持ち、設定から差し替えられる。
+#[derive(Debug, Clone, Copy)]
+pub struct MountTuning {
+    /// 書き込みを溜めてから送る閾値（バイト）。0 は毎回送る。
+    pub write_buffer: usize,
+    /// 同時実行スレッド数。
+    pub threads: usize,
+    /// アップロードの分割サイズ（バイト）。
+    pub part_size: u64,
+}
+
+impl Default for MountTuning {
+    fn default() -> Self {
+        Self {
+            write_buffer: 8 * 1024 * 1024,
+            threads: 8,
+            part_size: 4 * 1024 * 1024,
+        }
+    }
+}
+
 /// WinFsp バックエンドでマウントする。
 pub async fn mount_winfsp(session: Session, drive: &str) -> anyhow::Result<()> {
+    mount_winfsp_tuned(session, drive, MountTuning::default()).await
+}
+
+/// 調整値を指定して WinFsp でマウントする。
+pub async fn mount_winfsp_tuned(
+    session: Session,
+    drive: &str,
+    tuning: MountTuning,
+) -> anyhow::Result<()> {
     if !winfsp_available() {
         anyhow::bail!(
             "WinFsp がインストールされていません。`tbx mount {drive} --mode webdav` を使うか、https://winfsp.dev/ から WinFsp を導入してください。"
@@ -166,12 +196,12 @@ pub async fn mount_winfsp(session: Session, drive: &str) -> anyhow::Result<()> {
 
     #[cfg(all(windows, feature = "winfsp-backend"))]
     {
-        teraboxfs::mount_with_winfsp(session, drive).await
+        let _ = &tuning;
+        teraboxfs::mount_with_winfsp_tuned(session, drive, tuning).await
     }
     #[cfg(not(all(windows, feature = "winfsp-backend")))]
     {
-        let _ = session;
-        let _ = drive;
+        let _ = (session, drive, tuning);
         anyhow::bail!(
             "このビルドは WinFsp バックエンドを含んでいません。`--features winfsp-backend` と MSVC ターゲットでビルドしてください。`tbx mount {drive} --mode webdav` も使えます。"
         )
@@ -180,10 +210,23 @@ pub async fn mount_winfsp(session: Session, drive: &str) -> anyhow::Result<()> {
 
 /// FUSE バックエンドでマウントする。`mountpoint` はディレクトリ。
 pub async fn mount_fuse(session: Session, mountpoint: &str) -> anyhow::Result<()> {
+    mount_fuse_tuned(session, mountpoint, MountTuning::default()).await
+}
+
+/// 調整値を指定して FUSE でマウントする。
+pub async fn mount_fuse_tuned(
+    session: Session,
+    mountpoint: &str,
+    tuning: MountTuning,
+) -> anyhow::Result<()> {
     #[cfg(all(unix, feature = "fuse-backend"))]
     {
         let api = terabox_core::api::ApiClient::new(session.clone())?;
-        let fs = Arc::new(remote::TeraBoxFs::new(api, session));
+        let fs = Arc::new(remote::TeraBoxFs::with_part_size(
+            api,
+            session,
+            tuning.part_size,
+        ));
         // 容量は `TeraBoxFs` だけが持つ。`RemoteFs` を広げずに済むよう、
         // 参照を持たせたクロージャで渡す。
         let usage_source = Arc::clone(&fs);
@@ -192,12 +235,17 @@ pub async fn mount_fuse(session: Session, mountpoint: &str) -> anyhow::Result<()
             crate::runtime::block_on(async move { remote_api.usage().await })
                 .map(|u| (u.total, u.free))
         });
-        fuse_fs::mount(fs, std::path::Path::new(mountpoint), Some(usage)).await
+        fuse_fs::mount(
+            fs,
+            std::path::Path::new(mountpoint),
+            Some(usage),
+            tuning.threads,
+        )
+        .await
     }
     #[cfg(not(all(unix, feature = "fuse-backend")))]
     {
-        let _ = session;
-        let _ = mountpoint;
+        let _ = (session, mountpoint, tuning);
         anyhow::bail!(
             "このビルドは FUSE バックエンドを含んでいません。`--features fuse-backend` でビルドしてください。`tbx mount {mountpoint} --mode webdav` も使えます。"
         )
@@ -247,6 +295,7 @@ pub async fn mount_winfsp_encrypted(
     session: Session,
     drive: &str,
     cipher: terabox_core::crypt::Cipher,
+    tuning: MountTuning,
 ) -> anyhow::Result<()> {
     if !winfsp_available() {
         anyhow::bail!(
@@ -257,7 +306,11 @@ pub async fn mount_winfsp_encrypted(
     #[cfg(all(windows, feature = "winfsp-backend"))]
     {
         let api = terabox_core::api::ApiClient::new(session.clone())?;
-        let plain = Arc::new(remote::TeraBoxFs::new(api, session));
+        let plain = Arc::new(remote::TeraBoxFs::with_part_size(
+            api,
+            session,
+            tuning.part_size,
+        ));
 
         // 容量は平文側の実装から取る（暗号化で総量は変わらない）。
         let usage_source = Arc::clone(&plain);
@@ -270,11 +323,11 @@ pub async fn mount_winfsp_encrypted(
             plain as Arc<dyn terabox_core::vfs::RemoteFs + Send + Sync>,
             cipher,
         );
-        teraboxfs::mount_with_fs(Arc::new(encrypted), drive, Some(usage)).await
+        teraboxfs::mount_with_fs(Arc::new(encrypted), drive, Some(usage), tuning.write_buffer, tuning.threads).await
     }
     #[cfg(not(all(windows, feature = "winfsp-backend")))]
     {
-        let _ = (session, drive, cipher);
+        let _ = (session, drive, cipher, tuning);
         anyhow::bail!("このビルドは WinFsp バックエンドを含んでいません。");
     }
 }
