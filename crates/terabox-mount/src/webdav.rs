@@ -63,9 +63,11 @@ pub async fn serve_fs_and_connect(
     println!("WebDAV サーバを http://127.0.0.1:{actual_port}/ で起動しました。");
     println!("ドライブ {drive} を割り当てます...");
 
-    connect_drive(drive, actual_port)?;
-    println!("{drive} を割り当てました。Ctrl+C で終了します（終了時に切断します）。");
-
+    // 受付ループを **先に** 回す。`net use` は割り当ての途中で OPTIONS と
+    // PROPFIND を投げ、その応答が返るまで待つ。以前は `net use` の後に
+    // 受付ループを spawn していたため、割り当て中の要求に誰も応答できず
+    // 「システムエラー 67（ネットワーク名が見つかりません）」で失敗した
+    // （実測: 起動直後の OPTIONS が 10 秒でタイムアウトし http_code=000）。
     let server = tokio::spawn(async move {
         loop {
             let (stream, _) = match listener.accept().await {
@@ -87,6 +89,18 @@ pub async fn serve_fs_and_connect(
             });
         }
     });
+
+    // `net use` は外部プロセスを待つので、ランタイムのスレッドを塞がないよう
+    // ブロッキングタスクへ逃がす。
+    let drive_owned = drive.to_string();
+    let connected = tokio::task::spawn_blocking(move || connect_drive(&drive_owned, actual_port))
+        .await
+        .unwrap_or_else(|e| Err(anyhow::anyhow!("割り当てタスクが落ちました: {e}")));
+    if let Err(e) = connected {
+        server.abort();
+        return Err(e);
+    }
+    println!("{drive} を割り当てました。Ctrl+C で終了します（終了時に切断します）。");
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {}
@@ -174,6 +188,20 @@ where
 {
     let method = req.method().clone();
     let path = percent_decode(req.uri().path());
+    // ログ用にヘッダを先に控える。`PUT` などは本文を取るために `req` を
+    // 消費するので、match の後では読めない。
+    let depth = req
+        .headers()
+        .get("Depth")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let destination = req
+        .headers()
+        .get("Destination")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
 
     let response = match method.as_str() {
         "OPTIONS" => options_response(),
@@ -184,8 +212,26 @@ where
         "DELETE" => delete_path(fs.as_ref(), &path).await,
         "MKCOL" => mkcol(fs.as_ref(), &path).await,
         "MOVE" => move_path(fs.as_ref(), &path, &req).await,
+        "PROPPATCH" => proppatch(&path, req).await,
+        "LOCK" => lock_response(&path),
+        "UNLOCK" => {
+            let mut resp = Response::new(empty_body());
+            *resp.status_mut() = StatusCode::NO_CONTENT;
+            resp
+        }
         _ => text_response(StatusCode::METHOD_NOT_ALLOWED, "未対応のメソッドです"),
     };
+
+    // `--verbose` のときだけ出る。エクスプローラーがどのメソッドをどのパスへ
+    // 送り、何が返ったかを追えるようにする。
+    tracing::debug!(
+        method = %method,
+        path = %path,
+        depth = %depth,
+        destination = %destination,
+        status = response.status().as_u16(),
+        "webdav"
+    );
 
     Ok(response)
 }
@@ -209,10 +255,29 @@ fn options_response() -> Response<Body> {
     headers.insert("DAV", HeaderValue::from_static("1, 2"));
     headers.insert(
         "Allow",
-        HeaderValue::from_static("OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL, MOVE"),
+        HeaderValue::from_static(
+            "OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, PROPPATCH, MKCOL, MOVE, LOCK, UNLOCK",
+        ),
     );
     headers.insert("MS-Author-Via", HeaderValue::from_static("DAV"));
     resp
+}
+
+/// 「存在しない」を意味する errno。TeraBox は親フォルダが無いときなどに返す。
+const ERRNO_NOT_FOUND: i64 = -9;
+
+/// 中身が無い（errno -9）ときは 404、それ以外は 502。
+///
+/// 作成・名前変更の直後など、親の一覧がまだ反映されていないと `/api/list` が
+/// errno -9 を返す。以前はこれを 502 で返していたため、Windows は「サーバ異常」
+/// と解釈して操作を中断した（Issue #2）。404 なら「まだ無い」として扱われる。
+fn not_found_or_gateway(e: &terabox_core::TbxError) -> Response<Body> {
+    if let terabox_core::TbxError::Api(api) = e {
+        if api.errno == ERRNO_NOT_FOUND {
+            return text_response(StatusCode::NOT_FOUND, "見つかりません");
+        }
+    }
+    text_response(StatusCode::BAD_GATEWAY, &format!("{e}"))
 }
 
 fn text_response(status: StatusCode, message: &str) -> Response<Body> {
@@ -250,9 +315,35 @@ where
 
     let mut items: Vec<(String, Option<FsEntry>)> = Vec::new();
     match fs.metadata(&p).await {
-        Ok(Some(_)) => items.push((p.clone(), None)),
+        Ok(Some(meta)) => {
+            // 自身の行も実体の種別（フォルダかファイルか）を返す。以前は
+            // `None` で積んでいたため、`build_multistatus` がコレクション
+            // 扱いにしてサイズ 0 のフォルダとして応答していた。Windows は
+            // これを「同じ名前のフォルダが既にある」と解釈し、エクスプローラで
+            // 「指定されたファイル名と同じ名前のファイルが既に存在します」に
+            // なる（Issue #2）。
+            items.push((
+                p.clone(),
+                Some(FsEntry {
+                    fs_id: String::new(),
+                    server_filename: if p == "/" {
+                        String::new()
+                    } else {
+                        p.rsplit('/').next().unwrap_or(&p).to_string()
+                    },
+                    path: p.clone(),
+                    isdir: meta.is_dir,
+                    size: meta.size,
+                    server_mtime: meta.mtime,
+                    server_ctime: meta.mtime,
+                    md5: String::new(),
+                    thumbs: None,
+                    category: None,
+                }),
+            ));
+        }
         Ok(None) => return text_response(StatusCode::NOT_FOUND, "見つかりません"),
-        Err(e) => return text_response(StatusCode::BAD_GATEWAY, &format!("{e}")),
+        Err(e) => return not_found_or_gateway(&e),
     }
 
     if depth == "1" {
@@ -571,6 +662,92 @@ async fn mkcol(fs: &(dyn RemoteFs + Send + Sync), path: &str) -> Response<Body> 
     }
 }
 
+/// `PROPPATCH` に 207 で応答する。
+///
+/// `DAV: 1, 2` を名乗っているため、Windows はコピーの後に Win32 の時刻・
+/// 属性を書きに来る。405 を返すとエクスプローラのコピーが失敗する（Issue #2）。
+/// ここでは要求されたプロパティを「受け取った」とだけ返し、実際の値は
+/// サーバ側の更新時刻をそのまま使う（ローカル 1 人利用の前提）。
+async fn proppatch<B>(path: &str, req: Request<B>) -> Response<Body>
+where
+    B: HttpBody<Data = Bytes>,
+    B::Error: std::fmt::Display,
+{
+    let body = match req.into_body().collect().await {
+        Ok(b) => String::from_utf8_lossy(&b.to_bytes()).into_owned(),
+        Err(_) => String::new(),
+    };
+
+    // 変更を求められたプロパティ名を拾う（値の反映はしない）。
+    let mut names: Vec<String> = Vec::new();
+    let mut rest = body.as_str();
+    while let Some(i) = rest.find("<D:") {
+        rest = &rest[i + 3..];
+        let Some(j) = rest.find('>') else { break };
+        let name = &rest[..j];
+        // 名前空間付きの閉じタグや `prop` 自身は除く。最初の出現だけ拾う。
+        if !name.starts_with("Win32")
+            && !name.starts_with("GetLastModified")
+            && !name.starts_with("getlastmodified")
+        {
+            continue;
+        }
+        if !names.iter().any(|n| n == name) && name.chars().all(|c| c.is_ascii_alphanumeric()) {
+            names.push(name.to_string());
+        }
+    }
+
+    let mut xml = String::from(
+        r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:">"#,
+    );
+    xml.push_str("<D:response><D:href>");
+    xml.push_str(&encode_href(&normalize_path(path), false));
+    xml.push_str("</D:href>");
+    if names.is_empty() {
+        xml.push_str("<D:propstat><D:prop/><D:status>HTTP/1.1 200 OK</D:status></D:propstat>");
+    } else {
+        xml.push_str("<D:propstat><D:prop>");
+        for name in &names {
+            if name.starts_with("Win32") {
+                xml.push_str(&format!("<Z:{name}/>"));
+            } else {
+                xml.push_str(&format!("<D:{name}/>"));
+            }
+        }
+        xml.push_str("</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>");
+    }
+    xml.push_str("</D:response></D:multistatus>");
+
+    let mut resp = Response::new(boxed(Full::new(Bytes::from(xml))));
+    *resp.status_mut() = StatusCode::MULTI_STATUS;
+    resp.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/xml; charset=utf-8"),
+    );
+    resp
+}
+
+/// `LOCK` に 200 と `Lock-Token` を返す。
+///
+/// 実際の排他はしない（ローカル 1 人利用の前提）。Windows はコピーの前に
+/// LOCK を投げ、405 だと操作を止める。
+fn lock_response(path: &str) -> Response<Body> {
+    let token = "opaquelocktoken:silentbox-00000000-0000-0000-0000-000000000000";
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="utf-8"?><D:prop xmlns:D="DAV:"><D:lockdiscovery><D:activelock><D:locktype><D:write/></D:locktype><D:lockscope><D:exclusive/></D:lockscope><D:depth>infinity</D:depth><D:locktoken><D:href>{token}</D:href></D:locktoken><D:lockroot><D:href>{}</D:href></D:lockroot></D:activelock></D:lockdiscovery></D:prop>"#,
+        encode_href(&normalize_path(path), true)
+    );
+    let mut resp = Response::new(boxed(Full::new(Bytes::from(xml))));
+    *resp.status_mut() = StatusCode::OK;
+    let headers = resp.headers_mut();
+    headers.insert("Lock-Token", HeaderValue::from_static(token));
+    headers.insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("application/xml; charset=utf-8"),
+    );
+    resp
+}
+
 async fn move_path<B>(
     fs: &(dyn RemoteFs + Send + Sync),
     path: &str,
@@ -779,6 +956,104 @@ mod tests {
         let resp = handle(fs, request("OPTIONS", "/", &[])).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(resp.headers()["DAV"], "1, 2");
+    }
+
+    #[test]
+    fn errno_not_found_maps_to_404() {
+        // 作成・名前変更の直後は親の一覧がまだ反映されておらず、`/api/list` が
+        // errno -9 を返す。これを 502 で返すと Windows はサーバ異常と解釈して
+        // 操作を中断する（Issue #2）。
+        let api_err = terabox_core::TbxError::Api(terabox_core::error::ApiError {
+            endpoint: "/api/list".into(),
+            errno: ERRNO_NOT_FOUND,
+            message: Some("ファイルまたはフォルダが存在しません".into()),
+            request_id: None,
+        });
+        assert_eq!(not_found_or_gateway(&api_err).status(), StatusCode::NOT_FOUND);
+
+        let other = terabox_core::TbxError::Other("別の失敗".into());
+        assert_eq!(
+            not_found_or_gateway(&other).status(),
+            StatusCode::BAD_GATEWAY,
+            "存在しない以外は 502 のまま"
+        );
+    }
+
+    #[tokio::test]
+    async fn propfind_file_reports_it_as_a_file() {
+        // 自身の行がコレクション扱いになると、Windows は「同名のフォルダが
+        // 既にある」と解釈してコピーを失敗させる（Issue #2）。ファイルは
+        // ファイルとして、サイズ付きで返ることを固定する。
+        let mut files = std::collections::HashMap::new();
+        files.insert("/a.bin".to_string(), vec![0u8; 10]);
+        let fs: Arc<dyn RemoteFs + Send + Sync> = Arc::new(MockFs { files });
+        let resp = handle(
+            fs,
+            request("PROPFIND", "/a.bin", &[("Depth", "0")]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&body).into_owned();
+        assert!(
+            !text.contains("<D:collection/>"),
+            "ファイルをコレクションとして返してはいけない: {text}"
+        );
+        assert!(
+            text.contains("<D:getcontentlength>10</D:getcontentlength>"),
+            "サイズが入っていない: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn proppatch_answers_207_instead_of_405() {
+        // Windows はコピーの後に Win32 の時刻・属性を書きに来る。405 だと
+        // エクスプローラのコピーが失敗する（Issue #2）。
+        let fs: Arc<dyn RemoteFs + Send + Sync> = Arc::new(MockFs {
+            files: Default::default(),
+        });
+        let body = r#"<?xml version="1.0"?><D:propertyupdate xmlns:D="DAV:" xmlns:Z="urn:schemas-microsoft-com:"><D:set><D:prop><Z:Win32LastModifiedTime>Mon, 01 Jan 2024 00:00:00 GMT</Z:Win32LastModifiedTime></D:prop></D:set></D:propertyupdate>"#;
+        let req = Request::builder()
+            .method("PROPPATCH")
+            .uri("/a.bin")
+            .body(Full::new(Bytes::from(body.to_string())))
+            .expect("request");
+        let resp = handle(fs, req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::MULTI_STATUS);
+        let out = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8_lossy(&out).into_owned();
+        assert!(text.contains("200 OK"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn lock_and_unlock_are_accepted() {
+        let fs: Arc<dyn RemoteFs + Send + Sync> = Arc::new(MockFs {
+            files: Default::default(),
+        });
+        let resp = handle(fs.clone(), request("LOCK", "/a.bin", &[]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(
+            resp.headers().contains_key("Lock-Token"),
+            "Lock-Token が無い"
+        );
+
+        let resp = handle(fs, request("UNLOCK", "/a.bin", &[])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn options_advertises_the_write_methods() {
+        let fs: Arc<dyn RemoteFs + Send + Sync> = Arc::new(MockFs {
+            files: Default::default(),
+        });
+        let resp = handle(fs, request("OPTIONS", "/", &[])).await.unwrap();
+        let allow = resp.headers()["Allow"].to_str().unwrap().to_string();
+        for m in ["PROPPATCH", "LOCK", "UNLOCK", "MOVE", "MKCOL"] {
+            assert!(allow.contains(m), "{m} が Allow に無い: {allow}");
+        }
     }
 
     #[tokio::test]

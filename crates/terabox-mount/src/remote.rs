@@ -344,27 +344,29 @@ impl RemoteFs for TeraBoxFs {
             return Ok(());
         }
 
-        // `/api/filemanager?opera=rename` は、どのパラメータ形でも `errno 2`
-        // （param err）を返した（実測: filelist を配列/オブジェクト、newname を
-        // 名前/絶対パス、async あり/なしの 6 通りを試した）。仕様を特定できて
-        // いないため推測で実装せず、読み出し→再アップロード→削除で代替する。
-        let meta = self
-            .metadata(&from_n)
-            .await?
-            .ok_or_else(|| TbxError::Other(format!("{from_n} が見つかりません")))?;
+        // 名前変更と移動は API が用意している。以前は `filelist=["/a/old"]` +
+        // `newname=new` の形で送って `errno 2`（param err）になり、仕様を
+        // 特定できずに「読み出し→再アップロード→削除」で代替していた。
+        // Issue #2 の実測で `filelist` の要素をオブジェクトにする形が正しいと
+        // 分かったので、そちらへ切り替える（フォルダも動く）。
+        let from_parent = parent_path(&from_n);
+        let to_parent = parent_path(&to_n);
+        let to_name = base_name(&to_n);
 
-        if meta.is_dir {
-            return Err(TbxError::Other(
-                "フォルダの名前変更は未対応です（API の仕様が未確定）".to_string(),
-            ));
-        }
+        let result = if from_parent == to_parent {
+            self.api.rename_entry(&from_n, &to_name).await.map(|_| ())
+        } else {
+            self.api
+                .move_entry(&from_n, &to_parent, &to_name)
+                .await
+                .map(|_| ())
+        };
 
-        let data = self.read(&from_n).await?;
-        self.write(&to_n, &data).await?;
-        self.api.delete(&[from_n.clone()]).await?;
-        self.invalidate(&parent_path(&from_n));
-        self.invalidate(&parent_path(&to_n));
-        Ok(())
+        // 成功しても失敗しても、一覧のキャッシュは捨てる。片方だけ古いまま
+        // 残すと、直後の列挙で消えた名前や現れた名前が食い違う。
+        self.invalidate(&from_parent);
+        self.invalidate(&to_parent);
+        result.map_err(|e| TbxError::Other(e.to_string()))
     }
 
     async fn create_dir(&self, path: &str) -> Result<(), TbxError> {

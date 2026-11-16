@@ -660,3 +660,72 @@ WinFsp の `DirMarker` は「バッファに収まる範囲で切り詰めて返
 （`cleanup` は失敗を返せないので、失敗はログに残す）。修正後、T: からの
 削除でサーバ上からも消えること、改名も通ることを実測した。
 `FspCleanupDelete` が 0x01 であることを回帰テストで固定した。
+## 2026-11-17 実測: Windows の WebDAV マウント（Issue #2）
+
+`tbx mount T: --mode webdav` でエクスプローラーからの操作が失敗する、という
+報告を実測で確かめた。指摘は 5 点あり、いずれもコードの状態と一致した。
+
+### 1. 受付ループの位置（システムエラー 67）
+
+受付ループが `connect_drive`（`net use`）の後にあった。`net use` は割り当ての
+途中で OPTIONS と PROPFIND を投げ、その応答を待つ。応答する側がまだ動いて
+いないので待ちが切れる。
+
+実測: 起動直後に `curl -X OPTIONS http://127.0.0.1:8765/` を叩くと
+10 秒でタイムアウトし `http_code=000`、`T:` は付かなかった。
+
+修正: 受付ループを先に spawn し、`net use` を `spawn_blocking` で待つ。
+失敗したら `server.abort()` する。修正後、`T:` が付くことを実測した。
+
+### 2. PROPFIND の自身の行（同じ名前のファイルが既に存在します）
+
+`propfind` が自身の行を `(p, None)` で積んでいた。`build_multistatus` は
+`None` をコレクション扱いにするため、ファイルをサイズ 0 のフォルダとして
+応答していた。Windows はこれを「同名のフォルダがある」と解釈する。
+
+修正: `metadata` の結果から `FsEntry` を作って積む。実測:
+`/3C3F54E0-...jpeg` の PROPFIND が `resourcetype` 空・
+`getcontentlength` 909587 で返ることを確認した。
+
+### 3. 名前変更・移動
+
+`/api/filemanager?opera=rename` は `filelist=[{"path":...,"newname":...}]`
+に `async=2`・`onnest=fail` を付ける形が正しい。以前は
+`filelist=["/a/old"]` + トップレベルの `newname` で `errno 2`（param err）に
+なり、仕様を特定できずに「読み出し→再アップロード→削除」で代替していた。
+
+修正: `ApiClient::rename_entry` / `move_entry` を足し、`remote::rename` を
+そちらへ切り替えた（フォルダも動く）。form の形は純関数
+（`rename_filelist` / `move_filelist` / `rename_params`）へ出して試験で固定。
+
+実サーバでの成否は未検証。この環境では書き込み系 API が
+`need verify`（errno 450016）で拒否されており、再ログインもブラウザ経由で
+失敗したため、実際の rename を投げても拒否された。
+
+### 4. PROPPATCH / LOCK / UNLOCK
+
+`DAV: 1, 2` を名乗っているため Windows はコピーの前後にこれらを送る。
+405 のままだとコピーが止まる。
+
+修正: PROPPATCH は要求されたプロパティを 207 で返し、LOCK は
+`Lock-Token` 付きの 200、UNLOCK は 204 を返す。実際の排他はしない
+（ローカル 1 人利用の前提）。実測: LOCK 200、PROPPATCH 207、UNLOCK 204。
+
+### 5. 親が無いときの PROPFIND
+
+`/api/list` の errno -9 をそのまま 502 で返していた。502 だと Windows は
+サーバ異常とみなして操作を中断する。
+
+修正: errno -9 だけ 404 にし、他は 502 のまま。試験で固定した。
+
+### 実測の限界
+
+- 1・2・4・5 は修正後に実機で確認した。
+- 3 はコードの形を試験で固定したが、実サーバでの成否は未確認（上記のゲート）。
+- エクスプローラーからのコピー・上書き・移動そのものは、書き込みが
+  `need verify` で拒否されるため通しで確認できていない。
+
+### 補足で入れたもの
+
+`--verbose` のフィルタへ `terabox_mount=debug` を足し、WebDAV が
+メソッド・パス・Depth・Destination・ステータスの 1 行を出すようにした。

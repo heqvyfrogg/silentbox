@@ -565,6 +565,39 @@ impl ApiClient {
         self.post_form_json("/api/create", params, Vec::new()).await
     }
 
+    /// 名前変更（フォルダも可）。Issue #2 の実測に基づく形。
+    ///
+    /// form: `filelist=[{"path":"/a/old","newname":"new"}]`
+    /// query: `async=2`、`onnest=fail`
+    ///
+    /// 以前の形（`filelist=["/a/old"]` + `newname=new`）は、どの組み合わせでも
+    /// `errno 2`（param err）になった。`filelist` の要素をオブジェクトにし、
+    /// 名前をその中へ入れるのが正しい。
+    pub async fn rename_entry(&self, from: &str, new_name: &str) -> Result<Value, TbxError> {
+        let form = vec![("filelist".to_string(), rename_filelist(from, new_name))];
+        let params = rename_params();
+        self.post_form_json("/api/filemanager?opera=rename", params, form)
+            .await
+    }
+
+    /// 移動（別フォルダへ）。`dest` は移動先のディレクトリ。
+    ///
+    /// form: `filelist=[{"path":"/a/x","dest":"/b","newname":"x"}]`
+    pub async fn move_entry(
+        &self,
+        from: &str,
+        dest_dir: &str,
+        name: &str,
+    ) -> Result<Value, TbxError> {
+        let form = vec![(
+            "filelist".to_string(),
+            move_filelist(from, dest_dir, name),
+        )];
+        let params = rename_params();
+        self.post_form_json("/api/filemanager?opera=move", params, form)
+            .await
+    }
+
     /// 名前変更。`to_name` は新しい名前だけ（ディレクトリ移動は含まない）。
     pub async fn rename(&self, from: &str, to_name: &str) -> Result<Value, TbxError> {
         let form = vec![
@@ -834,6 +867,37 @@ fn escape_json(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// `opera=rename` 用の `filelist`。
+///
+/// Issue #2 の実測で、要素をオブジェクトにして `newname` をその中へ入れる形が
+/// 正しいと分かった。以前の `["/a/old"]` + トップレベルの `newname` は
+/// `errno 2`（param err）になった。
+fn rename_filelist(from: &str, new_name: &str) -> String {
+    format!(
+        "[{{\"path\":\"{}\",\"newname\":\"{}\"}}]",
+        escape_json(from),
+        escape_json(new_name)
+    )
+}
+
+/// `opera=move` 用の `filelist`。移動先は `dest`（ディレクトリ）。
+fn move_filelist(from: &str, dest_dir: &str, name: &str) -> String {
+    format!(
+        "[{{\"path\":\"{}\",\"dest\":\"{}\",\"newname\":\"{}\"}}]",
+        escape_json(from),
+        escape_json(dest_dir),
+        escape_json(name)
+    )
+}
+
+/// `rename` / `move` の共通クエリ。
+fn rename_params() -> Vec<(String, String)> {
+    vec![
+        ("async".to_string(), "2".to_string()),
+        ("onnest".to_string(), "fail".to_string()),
+    ]
+}
+
 /// `fs_id` 群を **数値の配列** にする（例: `[1089841491208719]`）。
 ///
 /// ゴミ箱系 API の `fidlist` は数値配列でなければ `errno 2`（param err）に
@@ -922,6 +986,42 @@ fn pick_string(value: &Value, keys: &[&str]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rename_filelist_uses_object_elements() {
+        // Issue #2 の実測で、要素をオブジェクトにする形だけが通った。
+        // 配列 + トップレベルの newname へ戻すと errno 2（param err）になる。
+        assert_eq!(
+            rename_filelist("/a/old.txt", "new.txt"),
+            r#"[{"path":"/a/old.txt","newname":"new.txt"}]"#
+        );
+    }
+
+    #[test]
+    fn rename_filelist_escapes_quotes_and_backslashes() {
+        let got = rename_filelist(r#"/a/"odd".txt"#, r#"b"c.txt"#);
+        assert!(got.starts_with(r#"[{"path":"/a/\"odd\".txt""#), "{got}");
+        assert!(got.contains(r#""newname":"b\"c.txt"}"#), "{got}");
+    }
+
+    #[test]
+    fn move_filelist_carries_dest_and_name() {
+        assert_eq!(
+            move_filelist("/a/x.txt", "/b", "x.txt"),
+            r#"[{"path":"/a/x.txt","dest":"/b","newname":"x.txt"}]"#
+        );
+    }
+
+    #[test]
+    fn rename_params_match_the_measured_shape() {
+        let params = rename_params();
+        assert!(params
+            .iter()
+            .any(|(k, v)| k == "async" && v == "2"));
+        assert!(params
+            .iter()
+            .any(|(k, v)| k == "onnest" && v == "fail"));
+    }
 
     #[test]
     fn shorturl_variants_normalize() {

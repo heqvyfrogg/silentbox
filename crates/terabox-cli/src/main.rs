@@ -321,7 +321,7 @@ fn main() -> Result<()> {
     std::env::set_var("TBX_ACCOUNT", &account);
 
     let filter = if cli.verbose {
-        "tbx=debug,terabox_core=debug"
+        "tbx=debug,terabox_core=debug,terabox_mount=debug"
     } else {
         "tbx=warn,terabox_core=warn"
     };
