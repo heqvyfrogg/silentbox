@@ -55,12 +55,21 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// ログインする（ブラウザを開いて Cookie を取得）。
+    /// ログインする（ブラウザ・CDP・非対話貼り付けで Cookie を取得）。
     Login {
-        /// Cookie を手で貼り付ける。
-        #[arg(long)]
+        /// Cookie を貼り付けてログインする（TTY 時は対話入力、`TBX_NDUS` や `--ndus-stdin` / `--ndus-file` と併用で非対話）。
+        #[arg(long, conflicts_with = "cdp_url")]
         paste: bool,
-        /// デバッグポート。
+        /// 起動済み Chromium の CDP エンドポイント（例: `http://127.0.0.1:9222`、`ws://...`）から `ndus` を取得する。
+        #[arg(long, env = "TBX_CDP_URL", conflicts_with_all = ["paste", "ndus_stdin", "ndus_file"])]
+        cdp_url: Option<String>,
+        /// `ndus` Cookie を標準入力から非対話で読み込む（シェル履歴に残らない）。
+        #[arg(long, conflicts_with_all = ["cdp_url", "ndus_file"])]
+        ndus_stdin: bool,
+        /// `ndus` Cookie を指定ファイルから非対話で読み込む。
+        #[arg(long, conflicts_with_all = ["cdp_url", "ndus_stdin"])]
+        ndus_file: Option<PathBuf>,
+        /// デバッグポート（ブラウザ自動起動時）。
         #[arg(long, default_value_t = 9333)]
         port: u16,
         /// ブラウザのユーザーデータディレクトリ。
@@ -69,8 +78,8 @@ enum Command {
         /// 登録するアカウント名。省略時は `--account` の解決結果。
         #[arg(long)]
         name: Option<String>,
-        /// 秘密の保存先（keyring / file）。省略時は自動。
-        #[arg(long)]
+        /// 秘密の保存先（auto / keyring / file）。省略時は auto（使えない環境では 0600 file へフォールバック）。
+        #[arg(long, env = "TBX_STORE")]
         store: Option<String>,
     },
     /// 保存済みセッションを削除する。
@@ -218,7 +227,11 @@ enum Command {
     /// 対話画面（TUI）を開く。
     Tui,
     /// 環境と接続を診断する。
-    Doctor,
+    Doctor {
+        /// 診断対象の CDP エンドポイント（省略時は `http://127.0.0.1:9222` を確認）。
+        #[arg(long, env = "TBX_CDP_URL")]
+        cdp_url: Option<String>,
+    },
     /// 未完了の転送を表示する。
     Transfers,
 }
@@ -344,11 +357,29 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Login {
             paste,
+            cdp_url,
+            ndus_stdin,
+            ndus_file,
             port,
             profile,
             name,
             store,
-        } => cmd_login(paste, port, profile, name, store, json).await,
+        } => {
+            cmd_login(
+                LoginOptions {
+                    paste,
+                    cdp_url,
+                    ndus_stdin,
+                    ndus_file,
+                    port,
+                    profile,
+                    name,
+                    store,
+                },
+                json,
+            )
+            .await
+        }
         Command::Logout { name, all } => cmd_logout(name, all, json),
         Command::Accounts => cmd_accounts(json),
         Command::Use { name } => cmd_use(&name, json),
@@ -393,7 +424,7 @@ async fn run(cli: Cli) -> Result<()> {
             delete_source,
         } => cmd_crypt_migrate(&path, apply, delete_source, json).await,
         Command::Tui => cmd_tui().await,
-        Command::Doctor => cmd_doctor(json).await,
+        Command::Doctor { cdp_url } => cmd_doctor(cdp_url, json).await,
         Command::Transfers => cmd_transfers(json),
     }
 }
@@ -506,58 +537,102 @@ fn map_session_error(e: TbxError) -> anyhow::Error {
 
 // ---- 各コマンド ----
 
-async fn cmd_login(
+struct LoginOptions {
     paste: bool,
+    cdp_url: Option<String>,
+    ndus_stdin: bool,
+    ndus_file: Option<PathBuf>,
     port: u16,
     profile: Option<PathBuf>,
     name: Option<String>,
     store: Option<String>,
-    json: bool,
-) -> Result<()> {
+}
+
+/// 標準入力やファイルから受け付ける `ndus` 入力の上限（64 KiB）。
+const MAX_NDUS_INPUT_BYTES: usize = 64 * 1024;
+
+async fn cmd_login(opts: LoginOptions, json: bool) -> Result<()> {
     let home = terabox_core::config::tbx_home();
-    let target = match name {
+    let target = match opts.name {
         Some(n) => {
             accounts::validate_name(&n).map_err(|e| anyhow!(e))?;
             n
         }
         None => account_name(),
     };
-    let kind = match store {
-        Some(s) => secret::StoreKind::parse(&s).map_err(|e| anyhow!(e))?,
-        None => secret::StoreKind::Keyring,
+    let pref = match opts.store {
+        Some(s) => secret::StorePreference::parse(&s).map_err(|e| anyhow!(e))?,
+        None => secret::StorePreference::Auto,
     };
 
-    let mut from_browser = None;
-    if !paste {
-        let profile = profile.unwrap_or_else(|| default_profile_dir(&target));
-        match login::login_with_browser(profile, port).await {
-            login::BrowserLogin::Success(session) => from_browser = Some(session),
+    let session = if let Some(cdp_url) = opts.cdp_url {
+        login::login_with_cdp_url(&cdp_url)
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+    } else if opts.ndus_stdin {
+        let ndus = read_ndus_from_stdin()?;
+        login::login_with_paste(ndus, env_js_token())
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+    } else if let Some(path) = opts.ndus_file {
+        let ndus = read_ndus_from_file(&path)?;
+        login::login_with_paste(ndus, env_js_token())
+            .await
+            .map_err(|e| anyhow!("{e}"))?
+    } else if opts.paste {
+        if let Some(env_ndus) = non_empty_env("TBX_NDUS") {
+            login::login_with_paste(env_ndus, env_js_token())
+                .await
+                .map_err(|e| anyhow!("{e}"))?
+        } else {
+            use std::io::IsTerminal;
+            if !std::io::stdin().is_terminal() {
+                bail!(
+                    "標準入力が対話端末（TTY）ではありません。\n\
+                     ヘッドレス環境では次のいずれかを指定してください:\n\
+                       - `tbx login --paste --ndus-stdin`（標準入力パイプから取り込み）\n\
+                       - `tbx login --paste --ndus-file <path>`（ファイルから取り込み）\n\
+                       - `TBX_NDUS=... tbx login --paste`（環境変数から取り込み）\n\
+                       - `tbx login --cdp-url http://127.0.0.1:9222`（起動済み Chromium から取得）"
+                );
+            }
+            paste_login_interactive().await?
+        }
+    } else {
+        let profile = opts
+            .profile
+            .unwrap_or_else(|| default_profile_dir(&target));
+        match login::login_with_browser(profile, opts.port).await {
+            login::BrowserLogin::Success(s) => s,
             login::BrowserLogin::NotLoggedIn => {
                 bail!("ログインを確認できませんでした。もう一度 `tbx login` を実行してください。")
             }
             login::BrowserLogin::Unavailable(reason) => {
-                eprintln!("{reason}");
-            }
-        }
-    }
-
-    let session = match from_browser {
-        Some(s) => s,
-        None => {
-            if paste {
-                paste_login_interactive().await?
-            } else {
-                bail!(
-                    "ブラウザでのログインを開始できませんでした。`tbx login --paste` で Cookie を貼り付けてください。"
-                )
+                bail!("{reason}")
             }
         }
     };
 
-    if let Err(e) = secret::save(&home, &target, kind, &session) {
-        eprintln!("警告: {e}");
-        eprintln!("このセッションは保存されていません。次の実行では再ログインが必要です。");
-        bail!("アカウント {target} を保存できませんでした");
+    let outcome = match secret::save_with_preference(&home, &target, pref, &session) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("警告: {e}");
+            eprintln!("このセッションは保存されていません。次の実行では再ログインが必要です。");
+            bail!("アカウント {target} を保存できませんでした");
+        }
+    };
+
+    if outcome.fell_back {
+        let path = secret::secret_file(&home, &target);
+        let reason = outcome
+            .fallback_reason
+            .as_deref()
+            .unwrap_or("OS 資格情報ストアが利用できません");
+        eprintln!("注意: {reason}。");
+        eprintln!(
+            "注意: セッションをファイル（0600 権限）へ自動フォールバック保存しました: {}",
+            path.display()
+        );
     }
 
     // 索引を更新する。保存に成功した後だけ載せる（載せたのに読めない状態を作らない）。
@@ -576,7 +651,8 @@ async fn cmd_login(
                 "name": target,
                 "server_account": session.account_label(),
                 "can_write": session.can_write(),
-                "store": kind.label(),
+                "store": outcome.kind.label(),
+                "store_fallback": outcome.fell_back,
                 "new": was_new,
             })
         );
@@ -589,7 +665,7 @@ async fn cmd_login(
                 session.account_label()
             );
         }
-        println!("保存先: {}", kind.label());
+        println!("保存先: {}", outcome.kind.label());
         if !session.can_write() {
             println!(
                 "注意: 書き込み用トークン（bdstoken）が取得できていません。アップロードや削除は失敗します。"
@@ -597,6 +673,45 @@ async fn cmd_login(
         }
     }
     Ok(())
+}
+
+fn non_empty_env(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn env_js_token() -> Option<String> {
+    non_empty_env("TBX_JS_TOKEN")
+}
+
+fn read_ndus_from_stdin() -> Result<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::io::stdin()
+        .take((MAX_NDUS_INPUT_BYTES + 1) as u64)
+        .read_to_end(&mut buf)
+        .context("標準入力から ndus を読めませんでした")?;
+    if buf.len() > MAX_NDUS_INPUT_BYTES {
+        bail!("標準入力のサイズが上限（64 KiB）を超えています");
+    }
+    let text = String::from_utf8(buf).map_err(|_| anyhow!("標準入力が UTF-8 ではありません"))?;
+    login::normalize_ndus_input(&text).map_err(|e| anyhow!("{e}"))
+}
+
+fn read_ndus_from_file(path: &std::path::Path) -> Result<String> {
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("{} を開けませんでした", path.display()))?;
+    if meta.len() > MAX_NDUS_INPUT_BYTES as u64 {
+        bail!("{} のサイズが上限（64 KiB）を超えています", path.display());
+    }
+    if let Err(warn) = secret::check_permissions(path) {
+        eprintln!("注意: {warn}");
+    }
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("{} を読めませんでした", path.display()))?;
+    login::normalize_ndus_input(&text).map_err(|e| anyhow!("{e}"))
 }
 
 async fn paste_login_interactive() -> Result<Session> {
@@ -1637,7 +1752,9 @@ fn crypt_password_file(secret_key: &str) -> std::path::PathBuf {
 
 #[cfg(feature = "crypt")]
 fn load_crypt_password(secret_key: &str) -> Result<String> {
-    if CRYPT_USE_KEYRING {
+    // 自動フォールバックで書かれたファイルが存在する場合は優先して読む。
+    let path = crypt_password_file(secret_key);
+    if !path.exists() && CRYPT_USE_KEYRING && secret::keyring_availability_issue().is_none() {
         #[cfg(any(target_os = "windows", target_os = "macos", target_env = "gnu"))]
         {
             let entry = crypt_password_entry(secret_key)?;
@@ -1651,9 +1768,11 @@ fn load_crypt_password(secret_key: &str) -> Result<String> {
         }
     }
 
-    let path = crypt_password_file(secret_key);
     if !path.exists() {
         bail!("暗号化のパスワードが保存されていません。`tbx crypt setup` を実行してください。");
+    }
+    if let Err(e) = secret::check_permissions(&path) {
+        bail!("{e}");
     }
     let text = std::fs::read_to_string(&path)
         .map_err(|e| anyhow!("{} を読めません: {e}", path.display()))?;
@@ -1668,13 +1787,21 @@ fn load_crypt_password(secret_key: &str) -> Result<String> {
 
 #[cfg(feature = "crypt")]
 fn store_crypt_password(secret_key: &str, password: &str) -> Result<()> {
-    if CRYPT_USE_KEYRING {
+    #[allow(unused_mut)]
+    let mut fallback_reason: Option<String> = secret::keyring_availability_issue();
+    if CRYPT_USE_KEYRING && fallback_reason.is_none() {
         #[cfg(any(target_os = "windows", target_os = "macos", target_env = "gnu"))]
         {
-            let entry = crypt_password_entry(secret_key)?;
-            return entry
-                .set_password(password)
-                .map_err(|e| anyhow!("暗号化のパスワードを保存できません: {e}"));
+            match crypt_password_entry(secret_key).and_then(|entry| {
+                entry
+                    .set_password(password)
+                    .map_err(|e| anyhow!("暗号化のパスワードを保存できません: {e}"))
+            }) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    fallback_reason = Some(e.to_string());
+                }
+            }
         }
     }
 
@@ -1682,6 +1809,11 @@ fn store_crypt_password(secret_key: &str, password: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .map_err(|e| anyhow!("{} を作れません: {e}", parent.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     let payload = serde_json::json!({ "password": password });
     std::fs::write(&path, serde_json::to_vec(&payload)?)
@@ -1691,6 +1823,9 @@ fn store_crypt_password(secret_key: &str, password: &str) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    if let Some(reason) = fallback_reason {
+        eprintln!("注意: {reason}。暗号化パスワードを 0600 ファイルへ保存しました: {}", path.display());
     }
     Ok(())
 }
@@ -2192,7 +2327,7 @@ fn cmd_transfers(json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_doctor(json: bool) -> Result<()> {
+async fn cmd_doctor(cdp_url: Option<String>, json: bool) -> Result<()> {
     let mut checks: Vec<(String, bool, String)> = Vec::new();
 
     match Config::load() {
@@ -2207,6 +2342,49 @@ async fn cmd_doctor(json: bool) -> Result<()> {
             ),
         )),
         Err(e) => checks.push(("設定".into(), false, format!("{e}"))),
+    }
+
+    // 表示環境（ヘッドレス判定）
+    {
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            let disp = non_empty_env("DISPLAY");
+            let wayland = non_empty_env("WAYLAND_DISPLAY");
+            let detail = match (disp, wayland) {
+                (Some(d), Some(w)) => format!("DISPLAY={d} / WAYLAND_DISPLAY={w}"),
+                (Some(d), None) => format!("DISPLAY={d}"),
+                (None, Some(w)) => format!("WAYLAND_DISPLAY={w}"),
+                (None, None) => {
+                    "ヘッドレス（DISPLAY / WAYLAND_DISPLAY 未設定）。`tbx login --cdp-url` または `--paste --ndus-stdin` / `--ndus-file` を使用してください".to_string()
+                }
+            };
+            checks.push(("表示環境".into(), true, detail));
+        }
+        #[cfg(not(all(unix, not(target_os = "macos"))))]
+        {
+            checks.push(("表示環境".into(), true, "デスクトップ GUI あり".into()));
+        }
+    }
+
+    // 秘密ストア（D-Bus / Secret Service / Keyring / file）
+    {
+        let store_env = non_empty_env("TBX_STORE");
+        let issue = secret::keyring_availability_issue();
+        let detail = match (&store_env, &issue) {
+            (Some(pref), Some(reason)) => {
+                format!("TBX_STORE={pref} / キーリング不可（{reason}）→ file（0600）を使用")
+            }
+            (Some(pref), None) => {
+                format!("TBX_STORE={pref} / OS 資格情報ストア利用可能見込み")
+            }
+            (None, Some(reason)) => {
+                format!("自動フォールバック（file 0600）/ キーリング不可: {reason}")
+            }
+            (None, None) => "OS 資格情報ストア利用可能見込み（既定: auto）".to_string(),
+        };
+        let explicit_keyring_broken =
+            matches!(store_env.as_deref(), Some("keyring")) && issue.is_some();
+        checks.push(("秘密ストア".into(), !explicit_keyring_broken, detail));
     }
 
     let home = terabox_core::config::tbx_home();
@@ -2250,6 +2428,74 @@ async fn cmd_doctor(json: bool) -> Result<()> {
         Err(e) => checks.push(("アカウント".into(), false, e)),
     }
 
+    // TLS / CA 検証とプロキシ環境変数
+    let cfg = config().unwrap_or_default();
+    {
+        let ca = terabox_core::http::inspect_ca_env();
+        let mut parts = Vec::new();
+        if let Some(f) = &ca.ssl_cert_file {
+            parts.push(format!("SSL_CERT_FILE={f}（{} 件）", ca.custom_cert_count));
+        }
+        if let Some(d) = &ca.ssl_cert_dir {
+            parts.push(format!("SSL_CERT_DIR={d}"));
+        }
+        if parts.is_empty() {
+            parts.push("OS ネイティブ CA + 埋め込み CA".to_string());
+        }
+
+        if let Some(err) = &ca.error {
+            checks.push(("TLS / CA".into(), false, format!("{} / {err}", parts.join(" / "))));
+        } else {
+            let probe_url = format!("{}/main", cfg.base_url.trim_end_matches('/'));
+            let tls_res = terabox_core::http::client_builder()
+                .map_err(|e| e.to_string())
+                .and_then(|b| {
+                    b.timeout(std::time::Duration::from_secs(10))
+                        .redirect(reqwest::redirect::Policy::none())
+                        .build()
+                        .map_err(|e| e.to_string())
+                });
+            match tls_res {
+                Ok(client) => match client.head(&probe_url).send().await {
+                    Ok(resp) => checks.push((
+                        "TLS / CA".into(),
+                        true,
+                        format!(
+                            "{} / {} へ TLS 疎通 OK（HTTP {}）",
+                            parts.join(" / "),
+                            cfg.base_url,
+                            resp.status().as_u16()
+                        ),
+                    )),
+                    Err(e) => checks.push((
+                        "TLS / CA".into(),
+                        false,
+                        format!("{} / {} への接続失敗: {e}", parts.join(" / "), cfg.base_url),
+                    )),
+                },
+                Err(e) => checks.push((
+                    "TLS / CA".into(),
+                    false,
+                    format!("{} / クライアント生成失敗: {e}", parts.join(" / ")),
+                )),
+            }
+        }
+    }
+
+    {
+        let proxies = terabox_core::http::inspect_proxy_env();
+        let detail = if proxies.is_empty() {
+            "未設定".to_string()
+        } else {
+            proxies
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        checks.push(("プロキシ".into(), true, detail));
+    }
+
     if let Ok(client) = api().await {
         match client.list("/", 1, 1, "name", false).await {
             Ok(_) => checks.push(("API /api/list".into(), true, "応答あり".into())),
@@ -2278,7 +2524,6 @@ async fn cmd_doctor(json: bool) -> Result<()> {
         }
     }
 
-    let cfg = config().unwrap_or_default();
     match pick_player(&cfg) {
         Some(p) => checks.push(("プレーヤ".into(), true, p)),
         None => checks.push((
@@ -2297,8 +2542,28 @@ async fn cmd_doctor(json: bool) -> Result<()> {
         None => checks.push((
             "ブラウザ".into(),
             false,
-            "Chrome / Edge が見つかりません（貼り付けログインは可能）".into(),
+            "Chrome / Edge / Chromium が見つかりません（貼り付け / CDP ログインは可能）".into(),
         )),
+    }
+
+    // CDP 診断（--cdp-url または既定 http://127.0.0.1:9222）
+    {
+        let explicit = cdp_url.is_some();
+        let target_url = cdp_url.unwrap_or_else(|| "http://127.0.0.1:9222".to_string());
+        match cdp::probe_version(&target_url, std::time::Duration::from_millis(1500)).await {
+            Ok(info) => checks.push(("CDP".into(), true, info)),
+            Err(e) => {
+                if explicit {
+                    checks.push(("CDP".into(), false, format!("{target_url} に接続できません: {e}")));
+                } else {
+                    checks.push((
+                        "CDP".into(),
+                        true,
+                        format!("{target_url} は未接続（起動済み Chromium が無ければ正常）"),
+                    ));
+                }
+            }
+        }
     }
 
     let winfsp = terabox_mount::winfsp_available();
