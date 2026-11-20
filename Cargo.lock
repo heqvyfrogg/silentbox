@@ -2859,7 +2859,7 @@ dependencies = [
 
 [[package]]
 name = "terabox-cli"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "chrono",
@@ -2890,7 +2890,7 @@ dependencies = [
 
 [[package]]
 name = "terabox-core"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "aes",
  "async-trait",
@@ -2926,7 +2926,7 @@ dependencies = [
 
 [[package]]
 name = "terabox-mount"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2949,7 +2949,7 @@ dependencies = [
 
 [[package]]
 name = "terabox-tui"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "anyhow",
  "chrono",

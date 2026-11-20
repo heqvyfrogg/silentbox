@@ -1,5 +1,30 @@
 # 変更履歴
 
+## 0.2.7 — 2026-11-20
+
+### 変更点
+
+- TLS 中継環境やカスタム CA を持つ環境で `UnknownIssuer` になる不具合を修正した（Issue #3）。`reqwest` の TLS 設定を `rustls-tls`（埋め込み CA のみ）から `rustls-tls-native-roots` と `rustls-tls-webpki-roots` の併用に改め、OS のネイティブ CA ストアと埋め込み CA の両方を信頼するようにした。
+- 全 OS で `SSL_CERT_FILE` を一貫して効かせるため、共通の HTTP クライアント構築（`terabox_core::http::client_builder`）で PEM バンドルを明示的に追加し、API・転送・ログインのクライアント生成をここへ統一した。カスタム CA 付きローカル HTTPS サーバーで、未指定時に `UnknownIssuer` で失敗し、`SSL_CERT_FILE` 指定後に HTTP 200 が返ることを Windows・Linux gnu・Alpine musl の実プロセスで確認した。
+- GUI が無い Linux 環境（`DISPLAY` と `WAYLAND_DISPLAY` が両方未設定）では、`tbx login` がブラウザを起動せず、ヘッドレス向けの代替手段を即時に案内して終了するようにした（Issue #4）。
+- TTY が無い環境で `tbx login --paste` を実行したときは、対話プロンプトで待機せず、非対話オプションを案内して終了するようにした。
+- ローカル（`127.0.0.1`、`localhost`、`::1`）の CDP 通信は `.no_proxy()` でプロキシ環境変数をバイパスするようにした。
+- 秘密ファイル保存（file ストア）は Unix でディレクトリ `0700`・一時ファイル `0600` を作成してから `rename` で原子置換するようにした。
+
+### 新機能
+
+- 起動済み Chromium からセッションを取り込む `tbx login --cdp-url <URL>`（環境変数 `TBX_CDP_URL`）を追加した。`http://` 指定時は `/json/list` を優先し、ページターゲットが無い場合は `/json/version` と `Storage.getCookies` へフォールバックする。接続先のブラウザは閉じない。
+- シェル履歴やコマンド引数に `ndus` を残さず取り込む非対話経路として `tbx login --paste --ndus-stdin`、`--ndus-file <path>`、環境変数 `TBX_NDUS`（任意で `TBX_JS_TOKEN`）を追加した。素の値に加え `ndus=...` や `Cookie:` 形式も受け付け、エラーやログに生値を出さない。
+- `--store`（環境変数 `TBX_STORE`）に `auto` を既定として追加した。musl ビルドや D-Bus 不在のヘッドレス Linux では `secrets/<name>.json`（`0600`）へ自動フォールバックし、理由と保存先パスを標準エラーに表示する。`--store keyring` 明示時はフォールバックせず失敗する。
+- `tbx doctor` に表示環境、秘密ストア（D-Bus と自動フォールバック状態）、TLS / CA（`SSL_CERT_FILE` の証明書件数と実 HTTPS 疎通）、プロキシ環境変数（認証情報を `***@` にマスク）、CDP 疎通（`--cdp-url` 指定可）の診断を追加した。
+- ヘッドレス Linux サーバー / VM 向けの運用ガイド `docs/headless.md` を追加した。
+
+### 注意点
+
+- 自動フォールバックで保存される `secrets/<name>.json` は `0600` 権限の平文 JSON であり、同一ユーザーや root からは読める。OS 資格情報ストアのみを強制したい場合は `--store keyring` または `TBX_STORE=keyring` を指定する。
+- `--cdp-url` はローカルの `http://` と `ws://` のみ対応する（`https://` と `wss://` は未対応）。
+- 特定の VM 出口環境で `HTTPS_PROXY` 設定時にタイムアウトする追加観測（Issue #3）については、ループバック CDP のプロキシバイパスと `tbx doctor` のプロキシ診断までを組み込んだ。実 VM 出口固有のプロキシ挙動は環境依存のため、同環境での再現確認が残る。
+
 ## 0.2.6 — 2026-11-17
 
 ### 変更点
