@@ -13,6 +13,7 @@ pub mod api;
 pub mod bootstrap;
 pub mod config;
 pub mod error;
+pub mod http;
 pub mod models;
 pub mod percent;
 pub mod session;

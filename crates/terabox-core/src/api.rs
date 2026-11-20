@@ -76,7 +76,7 @@ impl ApiClient {
             REFERER,
             HeaderValue::from_static("https://www.terabox.com/main?category=all"),
         );
-        let http = Client::builder()
+        let http = crate::http::client_builder()?
             .default_headers(headers)
             .redirect(reqwest::redirect::Policy::none())
             .timeout(std::time::Duration::from_secs(60))

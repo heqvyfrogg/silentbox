@@ -93,7 +93,7 @@ impl Downloader {
     /// セッションから作る。UA はセッションのものをそのまま使う
     /// （dlink 取得時と一致させる必要がある）。
     pub fn new(session: &Session) -> Result<Self, TbxError> {
-        let client = Client::builder()
+        let client = crate::http::client_builder()?
             .timeout(Duration::from_secs(120))
             .redirect(reqwest::redirect::Policy::limited(5))
             .build()?;
