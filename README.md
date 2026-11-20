@@ -52,7 +52,8 @@ cargo build --release -p terabox-cli --features fuse-backend
 無いと起動時に 1285 で終了する。
 
 musl で静的ビルドする場合は資格情報ストアを積まない（D-Bus の静的リンクが
-現実的でない）。`tbx login --store file` を使う。
+現実的でない）。`--store` 省略時は `secrets/<name>.json`（0600）へ自動フォールバックし、
+警告と保存先を表示する。`--store file`（または `TBX_STORE=file`）で明示もできる。
 
 ```bash
 cargo build --release -p terabox-cli --target x86_64-unknown-linux-musl
@@ -62,11 +63,13 @@ cargo build --release -p terabox-cli --target x86_64-unknown-linux-musl
 
 ```bash
 tbx login                       # ブラウザが開く。ログインすると自動で閉じる
+tbx login --cdp-url http://127.0.0.1:9222  # 起動済み Chromium から取得（ヘッドレス向け）
+cat ndus.txt | tbx login --paste --ndus-stdin  # 標準入力から非対話で取り込む
 tbx login --name work           # 2 つ目以降のアカウントを追加
 tbx accounts                    # 登録済みの一覧（* が既定、> が使用中）
 tbx use work                    # 既定を切り替え
 tbx --account work ls /         # この 1 回だけ別アカウントで
-tbx doctor                      # 環境と接続の診断
+tbx doctor                      # 環境・TLS/CA・CDP・プロキシ・接続の診断
 tbx ls /                        # 一覧
 tbx quota                       # 容量・無料枠の内訳・期限
 tbx get "/a/b.bin" -o ./dl      # 分割ダウンロード（中断しても再実行で再開）
@@ -92,9 +95,13 @@ WebDAV モードでは、エクスプローラーからの作成・名前変更�
 アカウント名は英数字・`_`・`-` の 32 文字まで。解決順は
 `--account` > 環境変数 `TBX_ACCOUNT` > 索引の既定 > `default` の順。
 
-- 秘密は OS の資格情報ストア（`account:<名前>`）に置く。
-- `--store file` を明示したときだけ `secrets/<名前>.json` に 0600 で書く。
+- 秘密は既定（`auto`）で OS の資格情報ストア（`account:<名前>`）に置く。
+- 資格情報ストアが使えない環境（ヘッドレス Linux / musl ビルド）では
+  `secrets/<名前>.json` に 0600 で自動フォールバック保存し、警告と保存先を出す。
+  `--store file` / `TBX_STORE=file` で明示指定、`--store keyring` で強制もできる。
   権限が緩いファイルは読む前に拒否する。
+- GUI なしの Linux サーバー / VM での運用手順（CDP 接続、非対話取り込み、
+  `SSL_CERT_FILE` によるカスタム CA、プロキシ診断）は `docs/headless.md` にある。
 - 台帳は `state-<名前>.db` に分かれる。アカウントを跨いでレジューム状態が
   混ざらない。
 - 旧版の `session` 1 件は、初回に `default` として自動で引き継ぐ。
